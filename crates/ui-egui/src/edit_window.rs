@@ -1369,6 +1369,17 @@ fn clip_at(track: &Track, at: Samples) -> Option<&Clip> {
 fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
     let id = ui.id().with(("lane", track.id.0));
     let resp = ui.interact(lane, id, Sense::click_and_drag());
+    // Audio files dropped from the Clip List.
+    if let Some(src) = resp.dnd_release_payload::<crate::DragSource>()
+        && let Some(p) = ui.ctx().pointer_latest_pos()
+    {
+        let s = app.engine.session();
+        let at = snap(s, sample_at(s, tl, p.x).max(0));
+        let _ = app.run("clip.place_source", json!({"source": src.0, "track": track.id.0, "at": at}));
+    }
+    if resp.dnd_hover_payload::<crate::DragSource>().is_some() {
+        ui.painter().rect_stroke(lane, 0.0, Stroke::new(2.0, Tokens::DARK.accent), StrokeKind::Inside);
+    }
     let s = app.engine.session().clone();
     let tool = s.edit.tool;
     let mods = ui.input(|i| i.modifiers);

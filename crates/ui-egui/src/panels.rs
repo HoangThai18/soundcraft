@@ -86,7 +86,7 @@ pub fn clip_list(app: &mut SoundApp, ui: &mut Ui) {
         let mut v: Vec<(Option<u64>, String, bool, [u8; 3])> = Vec::new();
         // Whole files first (bold), then clips on tracks.
         for src in &s.sources {
-            v.push((None, format!("{} ({}ch)", src.name, src.channels), true, [150, 150, 150]));
+            v.push((Some(src.id.0), format!("{} ({}ch)", src.name, src.channels), true, [150, 150, 150]));
         }
         for tr in &s.tracks {
             for c in tr.clips() {
@@ -98,8 +98,15 @@ pub fn clip_list(app: &mut SoundApp, ui: &mut Ui) {
     let selected: Vec<u64> = app.engine.session().edit.selected_clips.iter().map(|c| c.0).collect();
     egui::ScrollArea::vertical().id_salt("clips_scroll").auto_shrink([false, false]).show(ui, |ui| {
         for (id, name, whole, color) in items {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::click());
-            if id.is_some_and(|i| selected.contains(&i)) {
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), if whole { Sense::click_and_drag() } else { Sense::click() });
+            if whole && let Some(src) = id {
+                // Whole files drag onto tracks.
+                resp.dnd_set_drag_payload(crate::DragSource(src));
+                if resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
+            if !whole && id.is_some_and(|i| selected.contains(&i)) {
                 ui.painter().rect_filled(r, 0.0, Color32::from_rgb(52, 70, 96));
             }
             ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x + 6.0, r.min.y + 4.0), vec2(9.0, 9.0)), 1.0, rgb(color));
@@ -111,6 +118,7 @@ pub fn clip_list(app: &mut SoundApp, ui: &mut Ui) {
                 t.text,
             );
             if resp.clicked()
+                && !whole
                 && let Some(i) = id
             {
                 let _ = app.run("edit.select", json!({"clips": [i]}));
