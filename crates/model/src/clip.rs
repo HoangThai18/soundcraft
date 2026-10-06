@@ -190,7 +190,7 @@ impl Clip {
         // MIDI note ticks are re-anchored by the engine, which knows the tempo map.
         self.length -= delta;
         self.start = new_start;
-        self.fade_in.len = self.fade_in.len.min(self.length);
+        self.clamp_fades();
         self.gain_env = self.gain_env.iter().filter_map(|&(t, v)| (t - delta >= 0).then_some((t - delta, v))).collect();
     }
 
@@ -198,7 +198,13 @@ impl Clip {
     pub fn trim_end_to(&mut self, new_end: Samples) {
         let new_end = new_end.max(self.start + 1);
         self.length = new_end - self.start;
-        self.fade_out.len = self.fade_out.len.min(self.length);
+        self.clamp_fades();
+    }
+
+    /// Keep both fades within the clip.
+    pub fn clamp_fades(&mut self) {
+        self.fade_in.len = self.fade_in.len.clamp(0, self.length);
+        self.fade_out.len = self.fade_out.len.clamp(0, self.length);
     }
 }
 
@@ -261,5 +267,10 @@ mod tests {
         assert_eq!(c.length, 200);
         c.trim_end_to(-50);
         assert_eq!(c.length, 1);
+        // Regression: trimming the start must not leave a fade-out longer than the clip.
+        let mut c = Clip::audio(ClipId(2), "b", SourceId(1), 0, 0, 1000);
+        c.fade_out = Fade { len: 800, shape: FadeShape::Linear };
+        c.trim_start_to(900);
+        assert!(c.fade_out.len <= c.length);
     }
 }
