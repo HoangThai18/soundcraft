@@ -121,6 +121,16 @@ fn services() -> Services {
     }
 }
 
+/// The window, Dock, taskbar and Alt-Tab icon. macOS gets Apple's icon grid (transparent margin);
+/// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
+fn app_icon() -> Option<egui::IconData> {
+    #[cfg(target_os = "macos")]
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/soundcraft-macos-512.png");
+    #[cfg(not(target_os = "macos"))]
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.soundcraft.png");
+    eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -146,7 +156,7 @@ fn main() -> eframe::Result {
         .collect();
 
     let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SoundCraft")
             .with_inner_size([1600.0, 1000.0])
@@ -155,6 +165,9 @@ fn main() -> eframe::Result {
             .with_app_id("ai.storyteller.soundcraft"),
         ..Default::default()
     };
+    if let Some(icon) = app_icon() {
+        options.viewport = options.viewport.with_icon(icon);
+    }
     eframe::run_native(
         "SoundCraft",
         options,

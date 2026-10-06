@@ -1,0 +1,64 @@
+# Flatpak manifest for SoundCraft, ready for a Flathub submission.
+#
+# Flatpak builds run offline, so the crate sources must be vendored first. From the repo root:
+#
+#   curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/linux/flatpak/cargo-sources.json
+#   flatpak-builder --user --install --force-clean build-flatpak packaging/linux/flatpak/ai.storyteller.soundcraft.yml
+#   flatpak run ai.storyteller.soundcraft
+#
+# For Flathub, replace the `dir` source with a `git` source pinned to a release tag and commit.
+#
+# Audio: cpal talks to ALSA. alsa-lib (headers in the Sdk, the library in the Platform) and its
+# PulseAudio plugin ship with the freedesktop runtime, which routes ALSA through the PulseAudio
+# socket (PipeWire's pulse server on modern desktops), so no extra module is needed.
+id: ai.storyteller.soundcraft
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: soundcraft
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Playback and recording (ALSA through the PulseAudio/PipeWire socket).
+  - --socket=pulseaudio
+  # Open/Save dialogs use the file-chooser portal (rfd), and drag-and-drop uses the document
+  # portal, so broad filesystem access isn't needed. Music is granted for sessions and their
+  # "Audio Files" folders opened by path from the command line.
+  - --filesystem=xdg-music
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+modules:
+  - name: soundcraft
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/soundcraft/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline build --release --locked -p soundcraft -p soundcraft-cli
+      - install -Dm755 target/release/soundcraft /app/bin/soundcraft
+      - install -Dm755 target/release/soundcraft-cli /app/bin/soundcraft-cli
+      - install -Dm644 packaging/linux/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
+      - install -Dm644 packaging/linux/ai.storyteller.soundcraft.mime.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml
+      - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/
+      - >-
+        version=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml);
+        install -d /app/share/metainfo;
+        sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/"
+        packaging/linux/ai.storyteller.soundcraft.metainfo.xml.in > /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml
+    sources:
+      - type: dir
+        path: ../../..
+        skip:
+          - target
+          - dist
+          - corpus
+          - plan
+          - build-flatpak
+          - .flatpak-builder
+      - cargo-sources.json
