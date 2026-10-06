@@ -82,6 +82,22 @@ where things are.
     <td><b>Automation and markers.</b> Breakpoint automation for volume, pan, mute, sends and every plugin parameter, written live in Write, Touch and Latch, plus memory locations and a big counter.</td>
     <td><b>Everywhere.</b> Signed builds for macOS (universal), Windows (x64, x86, Arm), Linux (AppImage, deb, rpm, Flatpak), FreeBSD, and a WebAssembly build that runs in the browser.</td>
   </tr>
+  <tr>
+    <td width="50%"><img alt="The Video window showing a colour-bar test movie with a timecode burn-in, above a Video track with thumbnails in the Edit window" src="docs/images/video.png"></td>
+    <td width="50%"><img alt="The Renderer window showing a 7.1.4 speaker layout with two object tracks, beside the Mix window with surround panners and Object/Bed buttons" src="docs/images/surround.png"></td>
+  </tr>
+  <tr>
+    <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes and Motion JPEG in pure Rust, with timecode burn-in and sync offset.</td>
+    <td><b>Surround and immersive.</b> Main and bus formats from stereo to 9.1.6 and Ambisonics, a surround panner with divergence and height, object/bed routing and a Renderer window with live speaker levels.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="The Score Editor showing the lead melody in standard notation on a treble and bass staff" src="docs/images/score.png"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><b>Notation.</b> A Score Editor for MIDI tracks, MusicXML export for Sibelius and other notation programs, and printable engraved scores.</td>
+    <td><b>Your plugins too.</b> CLAP, VST3 and Audio Units, with their own editors, their state saved in the session, and every instance created off the audio thread.</td>
+  </tr>
 </table>
 
 ### Feature tour
@@ -191,7 +207,8 @@ and layering checks and the WebAssembly build.
 
 ## Status and roadmap
 
-SoundCraft is **pre-alpha**: the core works and is fun to use, and plenty is still missing. The
+SoundCraft is **pre-alpha, and close to its first alpha**: it covers 94 % of the incumbent's menu
+items and roughly two thirds of its features in depth. The core works and is fun to use, and plenty is still missing. The
 honest status, what's next and our effort estimates are in [`ROADMAP.md`](ROADMAP.md); the
 menu-by-menu comparison is in [`docs/parity.md`](docs/parity.md). Bug reports and wish lists are
 very welcome, in the issues or on Discord.
