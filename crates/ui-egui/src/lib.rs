@@ -14,6 +14,7 @@ pub mod midi_editor;
 pub mod mix_window;
 pub mod ops_windows;
 pub mod panels;
+pub mod score_editor;
 pub mod shortcuts;
 pub mod theme;
 pub mod toolbar;
@@ -80,6 +81,7 @@ pub struct UiState {
     pub show_time_ops: bool,
     pub show_midi_ops: bool,
     pub show_rtp: bool,
+    pub show_score: bool,
     pub workspace_dir: String,
     pub configurations: Vec<(String, Value)>,
 }
@@ -123,6 +125,7 @@ impl Default for UiState {
             show_time_ops: false,
             show_midi_ops: false,
             show_rtp: false,
+            show_score: false,
             workspace_dir: String::new(),
             configurations: Vec::new(),
         }
@@ -716,6 +719,7 @@ impl SoundApp {
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
         ops_windows::show(self, &ctx);
+        score_editor::show(self, &ctx);
         dialogs::show(self, &ctx);
     }
 
