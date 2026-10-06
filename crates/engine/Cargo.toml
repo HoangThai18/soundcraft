@@ -12,6 +12,7 @@ soundcraft-time.workspace = true
 soundcraft-audio-io.workspace = true
 soundcraft-midi.workspace = true
 soundcraft-dsp.workspace = true
+soundcraft-clap-host.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
 serde.workspace = true

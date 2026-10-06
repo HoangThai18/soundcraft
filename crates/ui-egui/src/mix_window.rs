@@ -285,7 +285,7 @@ fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: R
         Stroke::new(1.0, Color32::from_rgb(16, 16, 16)),
         StrokeKind::Inside,
     );
-    let label = ins.as_ref().and_then(|i| soundcraft_dsp::plugin_info(&i.plugin)).map_or("", |p| p.short_name);
+    let label = ins.as_ref().and_then(|i| plugin_info(&i.plugin)).map_or("", |p| p.short_name);
     if label.is_empty() {
         ui.painter().circle_filled(pos2(r.min.x + 6.0, r.center().y), 1.5, t.text_dim);
     } else {
@@ -324,6 +324,23 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
             }
         });
     }
+    // Third-party CLAP plugins (scanned once, cached by soundcraft-clap-host).
+    ui.menu_button("CLAP", |ui| {
+        let found: Vec<_> = soundcraft_clap_host::scan().into_iter().filter(|d| !d.is_instrument).collect();
+        if found.is_empty() {
+            ui.label("No CLAP plugins found");
+        }
+        for d in found {
+            if ui.button(format!("{} ({})", d.name, d.vendor)).clicked() {
+                let _ = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": d.id}));
+            }
+        }
+    });
+}
+
+/// A built-in plugin's description, else a hosted CLAP plugin's (`clap:<id>`).
+pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
+    soundcraft_dsp::plugin_info(id).or_else(|| soundcraft_clap_host::plugin_info(id))
 }
 
 fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {

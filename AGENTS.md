@@ -24,6 +24,7 @@ Pro Tools is installed on the dev machine and may be *observed* black-box: run i
 ## Never crash
 People trust SoundCraft with their recordings; a crash loses takes. **This outranks feature work.** Standard: [`craftrules/standards/never-crash.md`](https://github.com/storytold/craftrules/blob/main/standards/never-crash.md).
 - No panics in non-test code: no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
+- The one named exception is `soundcraft-clap-host` (`crates/clap-host`), the isolated unsafe helper crate for CLAP plugin FFI: `unsafe_code = "deny"` crate-wide, allowed only in `src/ffi.rs` with a `// SAFETY:` comment on every block, safe `Result` API.
 - Errors are `Result<T, E>` + `?`. An unfinished feature returns an "unsupported" error.
 - Input-derived numbers are hostile (files, commands, MCP/control params): `get()` not `[i]`, checked/saturating arithmetic, no NaN casts, cap allocations.
 - The audio callback never blocks, allocates in steady state, or panics.
