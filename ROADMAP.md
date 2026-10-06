@@ -22,7 +22,7 @@ the honest status: what works today, what is missing, and how far we are.
 | Mixer & routing | Faders, pan, mute/solo (SIP, implicit solo), sends pre/post, busses, aux inputs, master faders, VCAs, routing folders, 10 inserts, plugin delay compensation, clip effects | 70 % | 20 |
 | Automation | Breakpoint lanes for volume/pan/mute/sends/plugin params, trim automation; live Write/Touch/Latch passes; write/thin/glide/convert/coalesce commands | 60 % | 18 |
 | Plugins (built-in) | 26 original processors + 2 instruments, AudioSuite offline processing | 45 % | 30 |
-| Third-party plugins (CLAP/VST3/AU) | CLAP hosting (audio, params, latency, notes); VST3 hosting in progress; no plugin GUIs, no state save, no AU | 35 % | 28 |
+| Third-party plugins (CLAP/VST3/AU) | CLAP and VST3 hosting (audio, params, latency, notes, verified with a real VST3); no plugin GUIs, no state save in sessions, no AU | 55 % | 18 |
 | MIDI | MIDI/instrument tracks, SMF import/export, MIDI editor (piano roll + velocity), event list, step input, quantize/transpose/velocity/duration ops | 40 % | 30 |
 | Recording | Input capture, punch in/out (selection, on the fly, pre/post-roll), loop record into playlists, input monitoring through the channel strip, autosave and recovery | 60 % | 12 |
 | Elastic Audio / TCE / Beat Detective | Pitch-preserving warp on Elastic tracks, TCE to timeline, conform to tempo, Beat Detective and Identify Beat windows | 40 % | 18 |
