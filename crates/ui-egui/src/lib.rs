@@ -177,6 +177,7 @@ pub struct SoundApp {
     pub midi: midi_editor::MidiEditorState,
     pub ops: ops_windows::OpsState,
     pub synthetic: Vec<egui::Event>,
+    synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<control::PendingShot>,
     last_rev: u64,
@@ -212,6 +213,7 @@ impl SoundApp {
             midi: midi_editor::MidiEditorState::default(),
             ops: ops_windows::OpsState::default(),
             synthetic: Vec::new(),
+            synthetic_grace: 0,
             control_rx: None,
             pending_shots: Vec::new(),
             last_rev: 0,
@@ -576,28 +578,43 @@ impl SoundApp {
         {
             self.ensure_input();
         }
-        if self.is_playing() || self.meters.values().any(|m| m.level[0] > 0.0001) || !self.pending_shots.is_empty() {
+        if self.is_playing() || self.meters.values().any(|m| m.level[0] > 0.0001) || !self.pending_shots.is_empty() || !self.synthetic.is_empty() {
             ctx.request_repaint();
         }
         control::collect_screenshots(self, ctx);
     }
 
-    /// Feed queued synthetic input (from the control channel) into egui.
+    /// Feed queued synthetic input (from the control channel) into egui: one pointer event per
+    /// frame (so drags span frames like real ones), keys as press+release pairs, text at once.
     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
-        if self.synthetic.is_empty() {
-            return;
+        // While a synthetic gesture plays (and briefly after), the real pointer is ignored so it
+        // cannot interleave with the scripted one.
+        if !self.synthetic.is_empty() {
+            self.synthetic_grace = 6;
         }
-        let mut n = 0;
-        for e in &self.synthetic {
-            n += 1;
-            if matches!(e, egui::Event::PointerButton { pressed: false, .. } | egui::Event::Key { pressed: false, .. }) {
-                break;
+        if self.synthetic_grace > 0 {
+            self.synthetic_grace -= 1;
+            raw.events.retain(|e| {
+                !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::PointerGone | egui::Event::MouseMoved(_))
+            });
+        }
+        let Some(first) = self.synthetic.first().cloned() else { return };
+        let take = match first {
+            egui::Event::Key { pressed: true, .. } => {
+                // Press and the matching release together.
+                if matches!(self.synthetic.get(1), Some(egui::Event::Key { pressed: false, .. })) { 2 } else { 1 }
             }
-            if matches!(e, egui::Event::PointerButton { pressed: true, .. }) {
-                break;
+            _ => 1,
+        };
+        let n = take.min(self.synthetic.len());
+        let evs: Vec<egui::Event> = self.synthetic.drain(..n).collect();
+        for e in &evs {
+            if let egui::Event::PointerButton { pos, .. } | egui::Event::PointerMoved(pos) = e {
+                // Keep the hover position current for widgets that check it.
+                raw.events.push(egui::Event::PointerMoved(*pos));
             }
         }
-        raw.events.extend(self.synthetic.drain(..n.min(self.synthetic.len())));
+        raw.events.extend(evs);
     }
 
     /// Lay out the whole window.
