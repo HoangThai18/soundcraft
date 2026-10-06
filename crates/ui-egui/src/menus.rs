@@ -48,6 +48,11 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
     ("window.clip_effects", "Clip Effects", "Window > Clip Effects", None),
     ("window.clip_effects_dock", "Clip Effects", "View > Other Displays > Lower Dock > Clip Effects", None),
+    ("window.beat_detective", "Beat Detective", "", None),
+    ("window.tempo_ops", "Tempo Operations", "", None),
+    ("window.time_ops", "Time Operations", "", None),
+    ("window.midi_ops", "MIDI Operations", "", None),
+    ("window.rtp", "MIDI Real-Time Properties", "", None),
     ("window.playback_engine", "Playback Engine", "", None),
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
@@ -312,6 +317,11 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > I/O...", "window.io_setup"),
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
     ("Setup > Session", "setup.session"),
+    ("Event > Beat Detective", "window.beat_detective"),
+    ("Event > Tempo Operations > Tempo Operations Window", "window.tempo_ops"),
+    ("Event > Time Operations > Time Operations Window", "window.time_ops"),
+    ("Event > MIDI Operations > MIDI Operations Window", "window.midi_ops"),
+    ("Event > MIDI Real-Time Properties", "window.rtp"),
 ];
 
 /// Menu-style invocation: may open a dialog.
@@ -374,6 +384,11 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         }
         "window.automation" => toggle(&mut app.ui.show_automation),
         "window.clip_effects" | "window.clip_effects_dock" => toggle(&mut app.ui.show_clip_effects),
+        "window.beat_detective" => toggle(&mut app.ui.show_beat_detective),
+        "window.tempo_ops" => toggle(&mut app.ui.show_tempo_ops),
+        "window.time_ops" => toggle(&mut app.ui.show_time_ops),
+        "window.midi_ops" => toggle(&mut app.ui.show_midi_ops),
+        "window.rtp" => toggle(&mut app.ui.show_rtp),
         "window.playback_engine" => toggle(&mut app.ui.show_playback_engine),
         "window.io_setup" => toggle(&mut app.ui.show_io_setup),
         "window.shortcuts" => toggle(&mut app.ui.show_shortcuts),

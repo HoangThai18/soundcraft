@@ -12,6 +12,7 @@ pub mod icons;
 pub mod menus;
 pub mod midi_editor;
 pub mod mix_window;
+pub mod ops_windows;
 pub mod panels;
 pub mod shortcuts;
 pub mod theme;
@@ -74,6 +75,11 @@ pub struct UiState {
     pub show_io_setup: bool,
     pub show_shortcuts: bool,
     pub show_clip_effects: bool,
+    pub show_beat_detective: bool,
+    pub show_tempo_ops: bool,
+    pub show_time_ops: bool,
+    pub show_midi_ops: bool,
+    pub show_rtp: bool,
     pub workspace_dir: String,
     pub configurations: Vec<(String, Value)>,
 }
@@ -112,6 +118,11 @@ impl Default for UiState {
             show_io_setup: false,
             show_shortcuts: false,
             show_clip_effects: false,
+            show_beat_detective: false,
+            show_tempo_ops: false,
+            show_time_ops: false,
+            show_midi_ops: false,
+            show_rtp: false,
             workspace_dir: String::new(),
             configurations: Vec::new(),
         }
@@ -164,6 +175,7 @@ pub struct SoundApp {
     pub gesture: Option<Gesture>,
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
+    pub ops: ops_windows::OpsState,
     pub synthetic: Vec<egui::Event>,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<control::PendingShot>,
@@ -198,6 +210,7 @@ impl SoundApp {
             gesture: None,
             edit_layout: edit_window::EditLayout::default(),
             midi: midi_editor::MidiEditorState::default(),
+            ops: ops_windows::OpsState::default(),
             synthetic: Vec::new(),
             control_rx: None,
             pending_shots: Vec::new(),
@@ -606,6 +619,7 @@ impl SoundApp {
         }
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
+        ops_windows::show(self, &ctx);
         dialogs::show(self, &ctx);
     }
 
