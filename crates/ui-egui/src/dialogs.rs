@@ -18,7 +18,7 @@ pub enum Dialog {
     Number { cmd: String, title: String, key: String, value: f64, suffix: String },
     Fades { shape: String },
     StripSilence { threshold: f64, min_ms: f64, pre_ms: f64, post_ms: f64 },
-    Group { name: String },
+    Group { name: String, edit: bool, mix: bool, members: Vec<(u64, String, bool)> },
     Session { frame_rate: String, bit_depth: String },
 }
 
@@ -85,7 +85,11 @@ impl Dialogs {
             }
             "edit.fades_create" => Dialog::Fades { shape: "equal power".into() },
             "edit.strip_silence" => Dialog::StripSilence { threshold: -48.0, min_ms: 50.0, pre_ms: 5.0, post_ms: 20.0 },
-            "track.group" => Dialog::Group { name: format!("Group {}", e.session().groups.len() + 1) },
+            "track.group" => {
+                let s = e.session();
+                let members = s.tracks.iter().map(|t| (t.id.0, t.name.clone(), s.edit.selected_tracks.contains(&t.id))).collect();
+                Dialog::Group { name: format!("Group {}", s.groups.len() + 1), edit: true, mix: true, members }
+            }
             "setup.session" => Dialog::Session { frame_rate: e.session().frame_rate.label().into(), bit_depth: "24".into() },
             _ => {
                 return false;
@@ -286,10 +290,24 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::Group { name } => {
-                    ui.text_edit_singleline(name);
+                Dialog::Group { name, edit, mix, members } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(edit, "Edit group");
+                        ui.checkbox(mix, "Mix group");
+                    });
+                    ui.label("Tracks");
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for (_, n, on) in members.iter_mut() {
+                            ui.checkbox(on, n.as_str());
+                        }
+                    });
                     if buttons(ui, "OK", enter) {
-                        action = Some(("track.group".into(), json!({"name": name})));
+                        let ids: Vec<u64> = members.iter().filter(|m| m.2).map(|m| m.0).collect();
+                        action = Some(("track.group".into(), json!({"name": name, "edit": edit, "mix": mix, "tracks": ids})));
                     }
                 }
                 Dialog::Session { frame_rate, bit_depth } => {
