@@ -116,7 +116,7 @@ fn zoom_group(app: &mut SoundApp, ui: &mut Ui) {
 fn tools(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::DARK;
     let cur = app.engine.session().edit.tool;
-    group(ui, 268.0, 52.0, |ui, r| {
+    group(ui, 268.0 + 38.0, 52.0, |ui, r| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = vec2(2.0, 3.0);
             let row = ui.horizontal(|ui| {
@@ -160,6 +160,11 @@ fn tools(app: &mut SoundApp, ui: &mut Ui) {
                     if icon_button(ui, vec2(36.0, 18.0), icon, on, tip).clicked() {
                         let _ = app.run(id, json!({}));
                     }
+                }
+                let focus = e.keyboard_focus == "commands";
+                if crate::widgets::text_toggle(ui, vec2(36.0, 18.0), "a-z", focus, t.accent, "Commands Keyboard Focus (single-key editing)").clicked()
+                {
+                    let _ = app.run("options.keyboard_focus", json!({}));
                 }
             });
         });

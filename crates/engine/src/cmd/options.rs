@@ -49,6 +49,16 @@ pub fn specs() -> Vec<CommandSpec> {
             e.session_mut().edit.solo_mode = v.clone();
             Ok(json!({"mode": v}))
         }),
+        cmd!(noundo "options.keyboard_focus", "Keyboard Focus", [], None, "{focus?: commands|clips|groups|none} — toggles Commands Keyboard Focus when omitted", always, |e, p| {
+            let s = e.session_mut();
+            let f = match str_param(p, "focus") {
+                Some(f @ ("commands" | "clips" | "groups" | "none")) => f.to_string(),
+                Some(other) => return Err(bad("options.keyboard_focus", format!("unknown focus `{other}`"))),
+                None => if s.edit.keyboard_focus == "commands" { "none".into() } else { "commands".into() },
+            };
+            s.edit.keyboard_focus = f.clone();
+            Ok(json!({"focus": f}))
+        }),
         cmd!(noundo "options.pre_roll", "Pre-Roll Amount", [], None, "{length: samples|{seconds}}", always, |e, p| {
             let v = position_param(e, "options.pre_roll", p, "length")?.unwrap_or(0).max(0);
             e.session_mut().edit.pre_roll = v;
