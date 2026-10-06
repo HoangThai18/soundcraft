@@ -166,9 +166,14 @@ pub struct SoundApp {
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
     record_start: Samples,
+    /// Punch range to trim the take to (pre/post-roll recordings).
+    punch: Option<Range>,
     recorder_failed: bool,
     pub ui: UiState,
     pub services: Services,
+    /// Folder for crash-recovery autosaves (native apps set it).
+    pub autosave_dir: Option<std::path::PathBuf>,
+    last_autosave: f64,
     pub dialogs: dialogs::Dialogs,
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
@@ -202,9 +207,12 @@ impl SoundApp {
             player,
             recorder: None,
             record_start: 0,
+            punch: None,
             recorder_failed: false,
             ui: UiState::default(),
             services,
+            autosave_dir: None,
+            last_autosave: 0.0,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),
             main_meter: MeterDisplay::default(),
@@ -305,21 +313,72 @@ impl SoundApp {
         if let Some(p) = &self.player {
             p.set_recording(true);
         }
-        self.record_start = self.engine.session().edit.selection.start;
+        let already_playing = self.is_playing();
         if let Some(r) = &self.recorder {
             r.arm();
         }
         self.engine.transport.recording = true;
-        if !self.is_playing() {
-            let sel = self.engine.session().edit.selection;
-            if self.engine.session().edit.loop_record && !sel.is_empty() {
-                self.start_play(sel.start, None, Some(sel));
-            } else {
-                // Record into the selection when there is one (punch), else open-ended.
-                let end = (!sel.is_empty()).then_some(sel.end);
-                self.start_play(sel.start, end, None);
+        if already_playing {
+            // Punch in on the fly at the current playhead.
+            self.record_start = self.position();
+            self.punch = None;
+            return;
+        }
+        let e = self.engine.session().edit.clone();
+        let sel = e.selection;
+        if e.loop_record && !sel.is_empty() {
+            self.record_start = sel.start;
+            self.punch = None;
+            self.start_play(sel.start, None, Some(sel));
+        } else {
+            // Record into the selection when there is one (punch), with pre/post-roll if enabled;
+            // the take is trimmed back to the punch range afterwards.
+            let (pre, post) = if e.pre_post_roll { (e.pre_roll, e.post_roll) } else { (0, 0) };
+            let from = (sel.start - pre).max(0);
+            self.record_start = from;
+            self.punch = (!sel.is_empty()).then_some(sel);
+            let end = (!sel.is_empty()).then_some(sel.end + post);
+            self.start_play(from, end, None);
+        }
+    }
+
+    /// Every two minutes, copy a modified session to the autosave folder (not while recording).
+    fn autosave(&mut self, now: f64) {
+        let Some(dir) = self.autosave_dir.clone() else { return };
+        if self.last_autosave == 0.0 {
+            self.last_autosave = now;
+        }
+        if now - self.last_autosave < 120.0 || !self.engine.is_dirty() || self.engine.transport.recording {
+            return;
+        }
+        self.last_autosave = now;
+        let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
+        let path = dir.join(&name).join(format!("{name}.scraft"));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match soundcraft_engine::io::save_copy(&self.engine, &path.to_string_lossy()) {
+            Ok(_) => log::info!("autosaved to {}", path.display()),
+            Err(e) => log::warn!("autosave failed: {e}"),
+        }
+    }
+
+    /// The most recent autosave, if any.
+    pub fn latest_autosave(&self) -> Option<std::path::PathBuf> {
+        let dir = self.autosave_dir.as_ref()?;
+        let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        for d in std::fs::read_dir(dir).ok()?.flatten() {
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                let p = f.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("scraft")
+                    && let Ok(m) = f.metadata().and_then(|m| m.modified())
+                    && best.as_ref().is_none_or(|(t, _)| m > *t)
+                {
+                    best = Some((m, p));
+                }
             }
         }
+        best.map(|(_, p)| p)
     }
 
     /// Open the input device once (for recording and input monitoring) and feed the player.
@@ -376,7 +435,18 @@ impl SoundApp {
             return;
         }
         match soundcraft_engine::io::add_recording(&mut self.engine, self.record_start, take.channels, rate) {
-            Ok(ids) => self.ui.status = format!("Recorded {} clip(s)", ids.len()),
+            Ok(ids) => {
+                if let Some(p) = self.punch.take() {
+                    // Keep only the punch range of each new take (merged into the Record undo step).
+                    let clip_ids: Vec<u64> = ids.iter().map(|c| c.0).collect();
+                    let _ = self.engine.execute_merged(
+                        "edit.trim_to_fill_selection",
+                        &serde_json::json!({"clips": clip_ids, "start": p.start, "end": p.end}),
+                        "record",
+                    );
+                }
+                self.ui.status = format!("Recorded {} clip(s)", ids.len());
+            }
             Err(e) => self.ui.status = e.to_string(),
         }
     }
@@ -572,6 +642,7 @@ impl SoundApp {
         }
         self.handle_transport(dt);
         self.write_automation(ctx);
+        self.autosave(now);
         if self.recorder.is_none()
             && !self.recorder_failed
             && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)

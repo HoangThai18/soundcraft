@@ -174,6 +174,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let player = if no_audio { None } else { Some(soundcraft_playback::Player::new(Arc::new(engine.session().clone()))) };
             let mut app = SoundApp::new(engine, player, services());
+            app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
             if let Some(ui) = load_prefs() {
                 app.ui = ui;
             }
