@@ -89,23 +89,33 @@ where things are.
 - **Editing:** Shuffle, Slip, Spot and Grid modes; Smart, Selector, Grabber, Trim, Pencil, Zoom and
   Scrubber tools; cut, copy, paste, duplicate, repeat, shift, insert silence, separate (at
   selection, on grid, at transients), heal, consolidate, strip silence, nudge; fades and
-  crossfades in five shapes; playlists; clip gain lines; edit groups; undo for everything.
+  crossfades in five shapes, drawn straight from the clip corners; playlists with comping lanes;
+  clip gain lines; edit groups; single-key Commands Focus shortcuts; undo for everything.
 - **Mixing:** fader and pan with automation, pre/post sends, busses, aux inputs, master faders,
-  VCA masters, routing folders, solo modes, mute and solo groups, phase invert and trim.
-- **Plugins (all original):** 7-band and 1-band EQ, compressor/limiter, expander/gate, de-esser,
-  maximizer, channel strip, room and plate reverbs, mod delay, chorus, flanger, phaser, saturator,
-  lo-fi, rectifier, pitch shifter, time shift, gain, trim, invert, DC removal, signal generator,
-  dither, a subtractive synth and a drum synth. Any of them can also run offline as AudioSuite.
-- **Audio files:** WAV/BWF/RF64, AIFF/AIFC and FLAC in and out; MP3, Ogg Vorbis, AAC, ALAC and CAF in.
-  Any sample rate, any bit depth, up to 16 channels per track, and formats up to 9.1.6 and
-  7th-order Ambisonics in the model.
-- **Recording:** record-enable, punch into a selection, loop recording with one playlist per take.
-- **Time:** Bars|Beats, Min:Secs, Timecode (every rate including drop-frame), Feet+Frames and
-  Samples rulers and counters; tempo and meter maps; grid and nudge values in any of them.
-- **Bounce:** mix to WAV, AIFF or FLAC at 16/24/32-bit float with dither, normalisation, and
-  integrated loudness (LUFS) and true peak reported.
-- **Fast:** a parallel mix engine (sixty-plus tracks of plugins on one core with headroom to spare),
-  copy-on-write undo, and waveform overviews that keep the UI at display refresh rate.
+  VCA masters, routing folders, solo modes, mute and solo groups, phase invert and trim, clip
+  effects, and automatic plugin delay compensation.
+- **Automation:** volume, pan, mute, send and every plugin parameter; Write, Touch, Latch and
+  Trim passes recorded live from the faders; thin, glide, coalesce and convert to clip gain.
+- **Plugins:** 7-band and 1-band EQ, compressor/limiter, expander/gate, de-esser, maximizer,
+  channel strip, room and plate reverbs, mod delay, chorus, flanger, phaser, saturator, lo-fi,
+  rectifier, pitch shifter, time shift, gain, trim, invert, DC removal, signal generator, dither,
+  a subtractive synth and a drum synth, all original. **CLAP plugins** load too. Any processor
+  runs offline as AudioSuite, and user presets save per plugin.
+- **MIDI:** instrument and MIDI tracks, a piano-roll MIDI editor with a velocity lane, an event
+  list, a score view, step input, quantize, transpose, real-time properties, Standard MIDI Files,
+  and Audio-to-MIDI from a sung or played melody.
+- **Recording:** punch in on a selection or on the fly, pre/post-roll, loop recording with a
+  playlist per take, input monitoring through the full channel strip, and autosave with recovery.
+- **Time and tempo:** Bars|Beats, Min:Secs, Timecode (every rate, drop-frame included),
+  Feet+Frames and Samples; tempo and meter maps with a tempo editor; linear, parabolic and
+  S-curve tempo ramps; key signatures and detected chords; Beat Detective and Identify Beat;
+  pitch-preserving Elastic warping.
+- **Audio files:** WAV/BWF/RF64, AIFF/AIFC and FLAC in and out; MP3, Ogg Vorbis, AAC, ALAC, CAF
+  and the audio of MP4/MOV movies in. Any sample rate and bit depth.
+- **Bounce:** mix or stems to WAV, AIFF or FLAC at 16/24/32-bit float with dither and
+  normalisation, reporting peak, true peak and integrated loudness (LUFS).
+- **Fast:** a parallel mix engine, copy-on-write undo, and a UI that holds 120 frames per second
+  with seventy-odd tracks playing.
 
 ## Getting started
 
