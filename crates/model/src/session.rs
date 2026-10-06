@@ -267,7 +267,10 @@ impl Default for EditState {
             delay_compensation: true,
             keyboard_focus: "commands".into(),
             timeline_selection: Range::default(),
-            flags: ["view.clip.name", "view.clip.gain_line", "waveform.peak", "view.clip.overlap_shadows", "view.marker.ruler_lines"].iter().map(|s| s.to_string()).collect(),
+            flags: ["view.clip.name", "view.clip.gain_line", "waveform.peak", "view.clip.overlap_shadows", "view.marker.ruler_lines"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             values: std::collections::BTreeMap::new(),
         }
     }
@@ -296,6 +299,10 @@ pub struct Session {
     pub next_id: u64,
     #[serde(default)]
     pub comments: String,
+    /// Original MIDI performances keyed by clip id (Event › MIDI Operations › Restore/Flatten
+    /// Performance). Independent of undo so a restore survives later edits.
+    #[serde(default)]
+    pub midi_originals: std::collections::BTreeMap<u64, soundcraft_midi::Sequence>,
     #[serde(skip)]
     pub pool: SourcePool,
 }
@@ -328,6 +335,7 @@ impl Session {
             edit: EditState::default(),
             next_id: 1,
             comments: String::new(),
+            midi_originals: std::collections::BTreeMap::new(),
             pool: SourcePool::default(),
         };
         s.edit.pre_roll = sample_rate.samples(2.0);
@@ -522,6 +530,10 @@ impl Session {
                 l.points.sort_by_key(|p| p.at);
             }
         }
+        // Drop performances whose clip no longer exists anywhere (any playlist).
+        let clip_ids: std::collections::BTreeSet<u64> =
+            self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))).collect();
+        self.midi_originals.retain(|id, _| clip_ids.contains(id));
         if !self.edit.zoom.samples_per_px.is_finite() || self.edit.zoom.samples_per_px <= 0.0 {
             self.edit.zoom.samples_per_px = 1024.0;
         }

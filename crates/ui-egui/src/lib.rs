@@ -172,6 +172,9 @@ pub struct SoundApp {
     pub quit_requested: bool,
     /// Reset floating-window positions next frame (Window › Arrange).
     pub arrange_request: bool,
+    /// Tracks whose automation was touched during this pass (Touch/Latch writing).
+    touched: std::collections::HashSet<TrackId>,
+    last_write_at: Samples,
     pub frame_ms: f32,
     last_frame: Option<f64>,
 }
@@ -200,6 +203,8 @@ impl SoundApp {
             sim: None,
             quit_requested: false,
             arrange_request: false,
+            touched: std::collections::HashSet::new(),
+            last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
         }
@@ -289,9 +294,13 @@ impl SoundApp {
         self.engine.transport.recording = true;
         if !self.is_playing() {
             let sel = self.engine.session().edit.selection;
-            // Record into the selection when there is one (punch), else open-ended.
-            let end = (!sel.is_empty()).then_some(sel.end);
-            self.start_play(sel.start, end, None);
+            if self.engine.session().edit.loop_record && !sel.is_empty() {
+                self.start_play(sel.start, None, Some(sel));
+            } else {
+                // Record into the selection when there is one (punch), else open-ended.
+                let end = (!sel.is_empty()).then_some(sel.end);
+                self.start_play(sel.start, end, None);
+            }
         }
     }
 
@@ -300,9 +309,85 @@ impl SoundApp {
         let Some(r) = &self.recorder else { return };
         let take = r.take();
         let rate = take.sample_rate;
+        let sel = self.engine.session().edit.selection;
+        if self.engine.session().edit.loop_record && !sel.is_empty() {
+            // Split the capture into one take per loop pass; each pass gets its own playlist.
+            let pass = usize::try_from(soundcraft_time::to_samples(sel.len() as f64 * f64::from(rate) / self.engine.session().sample_rate.as_f64()))
+                .unwrap_or(0)
+                .max(1);
+            let total = take.channels.first().map_or(0, Vec::len);
+            let passes = total.div_ceil(pass).max(1);
+            let mut made = 0;
+            for k in 0..passes {
+                let chunk: Vec<Vec<f32>> =
+                    take.channels.iter().map(|c| c.get(k * pass..((k + 1) * pass).min(c.len())).map(<[f32]>::to_vec).unwrap_or_default()).collect();
+                if chunk.first().is_none_or(|c| c.len() < pass / 8) {
+                    continue;
+                }
+                if made > 0 {
+                    let armed: Vec<u64> = self.engine.session().tracks.iter().filter(|t| t.mixer.record_arm).map(|t| t.id.0).collect();
+                    let _ = self.engine.execute("track.playlist_new", &serde_json::json!({"tracks": armed}));
+                }
+                if soundcraft_engine::io::add_recording(&mut self.engine, sel.start, chunk, rate).is_ok() {
+                    made += 1;
+                }
+            }
+            self.ui.status = format!("Loop-recorded {made} take(s)");
+            return;
+        }
         match soundcraft_engine::io::add_recording(&mut self.engine, self.record_start, take.channels, rate) {
             Ok(ids) => self.ui.status = format!("Recorded {} clip(s)", ids.len()),
             Err(e) => self.ui.status = e.to_string(),
+        }
+    }
+
+    /// While playing, record volume automation from fader positions for tracks in Write mode, and
+    /// for Touch/Latch tracks whose fader is (or, for Latch, was) being moved. One undo step per pass.
+    fn write_automation(&mut self, ctx: &egui::Context) {
+        use soundcraft_model::AutomationMode as M;
+        if !self.is_playing() {
+            if !self.touched.is_empty() {
+                self.touched.clear();
+                self.engine.end_merge();
+            }
+            self.last_write_at = i64::MIN;
+            return;
+        }
+        let pos = self.position();
+        let step = self.engine.session().sample_rate.samples(0.02);
+        if (pos - self.last_write_at).abs() < step {
+            return;
+        }
+        self.last_write_at = pos;
+        let dragging = ctx.input(|i| i.pointer.any_down());
+        let fader_track = match &self.gesture {
+            Some(Gesture::Fader { track, .. }) => Some(*track),
+            _ => None,
+        };
+        let writes: Vec<(TrackId, f32)> = self
+            .engine
+            .session()
+            .tracks
+            .iter()
+            .filter_map(|t| {
+                let m = t.mixer.automation_mode;
+                let touched_now = dragging && fader_track == Some(t.id);
+                let write = match m {
+                    M::Write => true,
+                    M::Touch => touched_now,
+                    M::Latch | M::TouchLatch => touched_now || self.touched.contains(&t.id),
+                    _ => false,
+                };
+                write.then_some((t.id, t.mixer.volume_db))
+            })
+            .collect();
+        for (t, v) in writes {
+            self.touched.insert(t);
+            let _ = self.engine.execute_merged(
+                "automation.set_point",
+                &serde_json::json!({"track": t.0, "param": "volume", "at": pos, "value": v}),
+                "automation_pass",
+            );
         }
     }
 
@@ -430,6 +515,15 @@ impl SoundApp {
         self.last_frame = Some(now);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
+        if !ctx.input(|i| i.pointer.any_down()) {
+            if matches!(self.gesture, Some(Gesture::Fader { .. })) {
+                self.gesture = None;
+            }
+            // Keep a running automation pass merged until playback stops.
+            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() {
+                self.engine.end_merge();
+            }
+        }
         if self.engine.revision != self.last_rev {
             self.last_rev = self.engine.revision;
             if let Some(p) = &self.player {
@@ -437,6 +531,7 @@ impl SoundApp {
             }
         }
         self.handle_transport(dt);
+        self.write_automation(ctx);
         if self.is_playing() || self.meters.values().any(|m| m.level[0] > 0.0001) || !self.pending_shots.is_empty() {
             ctx.request_repaint();
         }

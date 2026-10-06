@@ -328,6 +328,7 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
     pl.sort();
     let mut made = 0;
+    let mut xfaded: Vec<ClipId> = Vec::new();
     let n = pl.clips.len();
     // Crossfades between adjacent clips whose boundary is inside the range.
     for i in 0..n.saturating_sub(1) {
@@ -351,13 +352,15 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
                 cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };
             }
             made += 1;
+            xfaded.push(a.id);
+            xfaded.push(b.id);
         }
     }
-    for c in &mut pl.clips {
-        if range.start <= c.start && range.end > c.start && range.end < c.end() && c.fade_in.len == 0 {
+    for c in pl.clips.iter_mut().filter(|c| !xfaded.contains(&c.id)) {
+        if range.start <= c.start && range.end > c.start && range.end < c.end() {
             c.fade_in = Fade { len: range.end - c.start, shape };
             made += 1;
-        } else if range.end >= c.end() && range.start > c.start && range.start < c.end() && c.fade_out.len == 0 {
+        } else if range.end >= c.end() && range.start > c.start && range.start < c.end() {
             c.fade_out = Fade { len: c.end() - range.start, shape };
             made += 1;
         }

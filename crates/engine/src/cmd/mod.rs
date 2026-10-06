@@ -8,16 +8,23 @@ use std::sync::OnceLock;
 
 mod audiosuite;
 mod clip;
-mod midi;
+mod clip_more;
 mod edit;
+mod edit_more;
 mod event;
+mod event_more;
 mod file;
+mod midi;
 mod mix;
+mod more_util;
 mod options;
 mod query;
+mod setup_more;
 mod track;
+mod track_more;
 mod transport;
 mod view;
+mod view_more;
 
 pub type Run = fn(&mut Engine, &Value) -> Result<Value>;
 /// `Err(reason)` = disabled.
@@ -85,6 +92,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(file::specs());
         v.extend(edit::specs());
+        v.extend(edit_more::specs());
         v.extend(view::specs());
         v.extend(track::specs());
         v.extend(clip::specs());
@@ -95,6 +103,11 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(query::specs());
         v.extend(audiosuite::specs());
         v.extend(midi::specs());
+        v.extend(view_more::specs());
+        v.extend(track_more::specs());
+        v.extend(clip_more::specs());
+        v.extend(event_more::specs());
+        v.extend(setup_more::specs());
         v
     })
 }

@@ -145,10 +145,19 @@ impl ChannelFormat {
     }
     /// Best format for a channel count.
     pub fn for_channels(n: usize) -> ChannelFormat {
-        [ChannelFormat::Mono, ChannelFormat::Stereo, ChannelFormat::Lcr, ChannelFormat::Quad, ChannelFormat::Surround50, ChannelFormat::Surround51, ChannelFormat::Surround70, ChannelFormat::Surround71]
-            .into_iter()
-            .find(|f| f.channels() == n)
-            .unwrap_or(if n <= 1 { ChannelFormat::Mono } else { ChannelFormat::Stereo })
+        [
+            ChannelFormat::Mono,
+            ChannelFormat::Stereo,
+            ChannelFormat::Lcr,
+            ChannelFormat::Quad,
+            ChannelFormat::Surround50,
+            ChannelFormat::Surround51,
+            ChannelFormat::Surround70,
+            ChannelFormat::Surround71,
+        ]
+        .into_iter()
+        .find(|f| f.channels() == n)
+        .unwrap_or(if n <= 1 { ChannelFormat::Mono } else { ChannelFormat::Stereo })
     }
 }
 

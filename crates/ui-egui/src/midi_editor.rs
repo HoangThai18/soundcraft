@@ -258,6 +258,6 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         && (x_of(n.start) - p.x).abs() < 8.0
     {
         let v = (((vel.max.y - 2.0 - p.y) / (vel.height() - 4.0)) * 127.0).round().clamp(1.0, 127.0) as i64;
-        let _ = app.engine.execute("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": v}));
+        let _ = app.engine.execute_merged("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": v}), &format!("vel:{}", cid.0));
     }
 }

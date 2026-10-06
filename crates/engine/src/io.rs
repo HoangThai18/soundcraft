@@ -128,7 +128,7 @@ pub fn export_midi(e: &Engine) -> Result<Vec<u8>> {
 }
 
 /// Render the main mix. Returns the encoded file and (peak dBFS, integrated LUFS).
-pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool) -> Result<(Vec<u8>, (f32, f32))> {
+pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool) -> Result<(Vec<u8>, (f32, f32, f32))> {
     let s = e.session();
     if r.len() > s.sample_rate.samples(4.0 * 3600.0) {
         return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
@@ -142,9 +142,10 @@ pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool)
     let frames = ch.first().map_or(0, Vec::len);
     lm.process(&ch, frames);
     let lufs = lm.integrated_lufs();
+    let true_peak = lm.true_peak_db();
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
     let bytes = soundcraft_audio_io::encode(&buf, opts).map_err(|err| EngineError::Io(err.to_string()))?;
-    Ok((bytes, (peak, lufs)))
+    Ok((bytes, (peak, lufs, true_peak)))
 }
 
 /// Transient positions (absolute) in a track's clips within `r`.
@@ -392,7 +393,9 @@ pub fn add_recording(e: &mut Engine, start: Samples, channels: Vec<Vec<f32>>, ra
         .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
         .map(|t| {
             let first = match &t.mixer.input {
-                soundcraft_model::Route::Hardware(h) => h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1)),
+                soundcraft_model::Route::Hardware(h) => {
+                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
+                }
                 _ => 0,
             };
             (t.id, first, t.channels(), t.name.clone())

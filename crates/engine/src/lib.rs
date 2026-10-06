@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod catalog;
+pub mod catalog_more;
 pub mod cmd;
 pub mod demo;
 pub mod edit;
@@ -69,6 +70,10 @@ pub struct Clipboard {
     pub length: Samples,
     pub tracks: Vec<Vec<Clip>>,
     pub automation: Vec<Vec<soundcraft_model::AutomationLane>>,
+    /// Copy Special › Clip Gain: per track, (offset from the copied range start, dB) breakpoints.
+    pub clip_gain: Vec<Vec<(Samples, f32)>>,
+    /// Copy Special › Clip Effects: clip-effect settings (`param` → value) of the first copied clip.
+    pub clip_effects: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +98,8 @@ pub struct Engine {
     /// Revision counter; bumps on every document change (UI caches key on it).
     pub revision: u64,
     dirty: bool,
+    /// Gesture key for undo coalescing (see `execute_merged`).
+    merge_key: Option<String>,
     /// Messages for the UI status line / agents.
     pub messages: Vec<String>,
 }
@@ -118,6 +125,7 @@ impl Engine {
             path: None,
             revision: 1,
             dirty: false,
+            merge_key: None,
             messages: Vec::new(),
         }
     }
@@ -203,9 +211,15 @@ impl Engine {
     /// Run a command by id. Never panics: escaped panics become `EngineError::Internal` and the
     /// document is restored.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        self.merge_key = None;
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(reason) = (spec.enabled)(self) {
-            return Err(EngineError::Disabled(id.to_string(), reason));
+            // A call that names its targets (tracks, clips, a range) does not need a selection;
+            // the command itself validates them.
+            let names_targets = ["track", "tracks", "clip", "clips", "start", "end", "at"].iter().any(|k| params.get(k).is_some());
+            if !names_targets {
+                return Err(EngineError::Disabled(id.to_string(), reason));
+            }
         }
         let before = Arc::clone(&self.doc);
         let rev = self.revision;
@@ -244,6 +258,25 @@ impl Engine {
         }
     }
 
+    /// Execute as part of a continuous gesture (fader drag, knob turn, slider): consecutive calls
+    /// with the same `key` collapse into a single undo step.
+    pub fn execute_merged(&mut self, id: &str, params: &Value, key: &str) -> Result<Value> {
+        let continuing = self.merge_key.as_deref() == Some(key);
+        let before_len = self.undo.len();
+        let r = self.execute(id, params)?;
+        if continuing && self.undo.len() == before_len + 1 && before_len > 0 {
+            // Drop the step just pushed; the earlier one still holds the pre-gesture document.
+            self.undo.pop();
+        }
+        self.merge_key = Some(key.to_string());
+        Ok(r)
+    }
+
+    /// End a gesture started with `execute_merged`.
+    pub fn end_merge(&mut self) {
+        self.merge_key = None;
+    }
+
     /// Convenience: execute with `{}` params.
     pub fn run(&mut self, id: &str) -> Result<Value> {
         self.execute(id, &json!({}))
@@ -278,4 +311,22 @@ fn install_panic_hook() {
             prev(info);
         }));
     });
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merged_gesture_is_one_undo_step() {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        for db in [-1.0, -2.0, -3.0, -4.0] {
+            e.execute_merged("mix.volume", &json!({"track": t.0, "db": db}), "fader").unwrap();
+        }
+        e.end_merge();
+        assert_eq!(e.undo_history().len(), 1);
+        e.undo();
+        assert_eq!(e.session().track(t).unwrap().mixer.volume_db, 0.0);
+    }
 }

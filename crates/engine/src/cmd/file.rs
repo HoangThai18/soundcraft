@@ -154,5 +154,7 @@ fn bounce(e: &mut Engine, p: &Value) -> Result<Value> {
     let normalize = bool_or(p, "normalize", false);
     let (bytes, stats) = crate::io::bounce_bytes(e, r, &opts, normalize)?;
     std::fs::write(&path, &bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
-    Ok(json!({"path": path, "bytes": bytes.len(), "seconds": e.session().sample_rate.seconds(r.len()), "peak_db": stats.0, "lufs": stats.1}))
+    Ok(
+        json!({"path": path, "bytes": bytes.len(), "seconds": e.session().sample_rate.seconds(r.len()), "peak_db": stats.0, "lufs": stats.1, "true_peak_db": stats.2}),
+    )
 }

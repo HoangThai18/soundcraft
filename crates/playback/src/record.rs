@@ -72,7 +72,13 @@ impl Recorder {
             )
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Recorder { shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels: usize::from(config.channels).max(1) })
+        Ok(Recorder {
+            shared,
+            _stream: Some(stream),
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels: usize::from(config.channels).max(1),
+        })
     }
 
     #[cfg(target_os = "freebsd")]
