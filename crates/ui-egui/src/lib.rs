@@ -73,6 +73,7 @@ pub struct UiState {
     pub show_playback_engine: bool,
     pub show_io_setup: bool,
     pub show_shortcuts: bool,
+    pub show_clip_effects: bool,
     pub workspace_dir: String,
     pub configurations: Vec<(String, Value)>,
 }
@@ -110,6 +111,7 @@ impl Default for UiState {
             show_playback_engine: false,
             show_io_setup: false,
             show_shortcuts: false,
+            show_clip_effects: false,
             workspace_dir: String::new(),
             configurations: Vec::new(),
         }
