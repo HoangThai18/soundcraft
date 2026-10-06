@@ -288,7 +288,7 @@ impl MixEngine {
         let pdc = s.edit.delay_compensation;
         let lmax_t = if pdc { work.iter().map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         let lmax_a = if pdc {
-            self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(|t| is_aux(t))).map(|(_, st)| st.latency).max().unwrap_or(0)
+            self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0)
         } else {
             0
         };
