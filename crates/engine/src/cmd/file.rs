@@ -62,6 +62,26 @@ pub fn specs() -> Vec<CommandSpec> {
             let tracks = crate::io::import_midi_bytes(e, &bytes, at, bool_or(p, "tempo_map", true))?;
             Ok(json!({"tracks": tracks}))
         }),
+        cmd!(
+            "file.import_video",
+            "Video...",
+            ["File", "Import"],
+            Some("Cmd+Ctrl+I"),
+            "{path, at?} — imports the movie's audio onto a new track (picture playback is not supported yet)",
+            always,
+            |e, p| {
+                let path = str_param(p, "path").ok_or_else(|| bad("file.import_video", "`path` required"))?.to_string();
+                let at = position_param(e, "file.import_video", p, "at")?.unwrap_or(0).max(0);
+                let bytes = std::fs::read(&path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+                let stem = std::path::Path::new(&path).file_stem().and_then(|n| n.to_str()).unwrap_or("Video").to_string();
+                let ext = std::path::Path::new(&path).extension().and_then(|x| x.to_str()).unwrap_or("mp4").to_ascii_lowercase();
+                let name = format!("{stem} audio.{}", if ext == "mov" { "mp4" } else { ext.as_str() });
+                let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), None, at)
+                    .map_err(|err| EngineError::Io(format!("{path}: no usable audio stream ({err})")))?;
+                e.message(format!("{stem}: imported the audio; video picture is not shown yet"));
+                Ok(r)
+            }
+        ),
         cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true}", always, bounce),
         cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?}", has_tracks, |e, p| {
             let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
