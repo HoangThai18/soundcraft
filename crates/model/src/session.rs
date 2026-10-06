@@ -197,6 +197,29 @@ pub struct EditState {
     pub keyboard_focus: String,
     /// Timeline selection when it is unlinked from the edit selection.
     pub timeline_selection: Range,
+    /// Generic on/off view and option flags keyed by id (e.g. `view.clip.name`, `waveform.rectified`,
+    /// `options.midi_thru`). Saved with the session so every view setting persists.
+    #[serde(default)]
+    pub flags: std::collections::BTreeSet<String>,
+    /// Numeric settings keyed by id (e.g. `click.volume_db`, `engine.buffer_size`).
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, f64>,
+}
+
+impl EditState {
+    pub fn flag(&self, id: &str) -> bool {
+        self.flags.contains(id)
+    }
+    pub fn set_flag(&mut self, id: &str, on: bool) {
+        if on {
+            self.flags.insert(id.to_string());
+        } else {
+            self.flags.remove(id);
+        }
+    }
+    pub fn value(&self, id: &str, default: f64) -> f64 {
+        self.values.get(id).copied().filter(|v| v.is_finite()).unwrap_or(default)
+    }
 }
 
 fn yes() -> bool {
@@ -244,6 +267,8 @@ impl Default for EditState {
             delay_compensation: true,
             keyboard_focus: "commands".into(),
             timeline_selection: Range::default(),
+            flags: ["view.clip.name", "view.clip.gain_line", "waveform.peak", "view.clip.overlap_shadows", "view.marker.ruler_lines"].iter().map(|s| s.to_string()).collect(),
+            values: std::collections::BTreeMap::new(),
         }
     }
 }
