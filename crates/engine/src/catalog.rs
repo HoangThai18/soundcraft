@@ -129,6 +129,6 @@ mod tests {
         let done = p["implemented"].as_u64().unwrap_or(0);
         // The floor only ever rises.
         assert!(pct >= 25.0, "engine parity regressed: {pct}%");
-        assert!(done >= 386, "engine parity regressed: {done} menu items");
+        assert!(done >= 396, "engine parity regressed: {done} menu items");
     }
 }

@@ -7,11 +7,13 @@
 
 pub mod catalog;
 pub mod catalog_more;
+pub mod clip_group_file;
 pub mod cmd;
 pub mod demo;
 pub mod edit;
 pub mod inspect;
 pub mod io;
+pub mod score;
 
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, Session, TrackId};
@@ -74,6 +76,8 @@ pub struct Clipboard {
     pub clip_gain: Vec<Vec<(Samples, f32)>>,
     /// Copy Special › Clip Effects: clip-effect settings (`param` → value) of the first copied clip.
     pub clip_effects: Vec<(String, f64)>,
+    /// Markers inside the copied range (starts relative to it), for Paste Special › Merge Markers.
+    pub markers: Vec<soundcraft_model::MemoryLocation>,
 }
 
 #[derive(Debug, Clone)]

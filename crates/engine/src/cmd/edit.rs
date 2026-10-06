@@ -185,6 +185,19 @@ fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
             .unwrap_or_default();
         cb.automation.push(lanes);
     }
+    cb.markers = e
+        .session()
+        .markers
+        .iter()
+        .filter(|m| m.kind == soundcraft_model::MarkerKind::Marker && range.contains(m.start))
+        .map(|m| {
+            let mut m = m.clone();
+            m.end -= m.start;
+            m.start -= range.start;
+            m.end += m.start;
+            m
+        })
+        .collect();
     if cut {
         let sh = shuffle(e.session());
         let s = e.session_mut();

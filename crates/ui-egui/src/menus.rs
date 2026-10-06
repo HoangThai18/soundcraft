@@ -339,7 +339,7 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);
         return;
     }
-    if DIALOG_COMMANDS.contains(&id) && app.dialogs.open_for_command(&app.engine, id) {
+    if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {
         return;
     }
     let params = params_for(path, id);
@@ -348,7 +348,12 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
 
 /// Keyboard shortcut for a dialog command: open its dialog. Returns true when handled.
 pub fn invoke_shortcut_dialog(app: &mut SoundApp, id: &str) -> bool {
-    DIALOG_COMMANDS.contains(&id) && app.dialogs.open_for_command(&app.engine, id)
+    wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id)
+}
+
+/// Commands that open a dialog first: the listed ones, Score Setup, and anything that needs a path.
+fn wants_dialog(id: &str) -> bool {
+    DIALOG_COMMANDS.contains(&id) || id == "file.score_setup" || crate::dialogs::takes_path(id)
 }
 
 /// Handle UI-layer commands. Returns None when `id` is not a UI command.
