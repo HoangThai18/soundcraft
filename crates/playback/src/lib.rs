@@ -8,6 +8,8 @@
 //! falls back to a silent clock thread so the transport, meters and automation still run.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod record;
+
 use soundcraft_mix::{MixEngine, StripMeter};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};

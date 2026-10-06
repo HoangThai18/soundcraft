@@ -9,6 +9,17 @@ use soundcraft_model::{AutoParam, Clip, ClipContent, ClipId, Session, Tool, Trac
 use soundcraft_time::{GridValue, NoteValue, Range, Samples, TimeFormat, format_position};
 
 pub const HEADER_W: f32 = 236.0;
+pub const COLUMN_W: f32 = 112.0;
+
+/// Optional Edit-window columns (View › Edit Window Views) that are switched on.
+pub fn edit_columns(s: &Session) -> Vec<&'static str> {
+    let all = s.edit.flag("edit_view.all");
+    ["io", "inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "comments"].into_iter().filter(|c| all || s.edit.flag(&format!("edit_view.{c}"))).collect()
+}
+
+pub fn header_width(s: &Session) -> f32 {
+    HEADER_W + COLUMN_W * edit_columns(s).len() as f32
+}
 pub const RULER_H: f32 = 17.0;
 
 /// Geometry of the last frame, for hit testing and agents (`ui.inspect`).
@@ -36,6 +47,10 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::DARK;
     egui::Panel::top("edit_toolbar").exact_size(toolbar::HEIGHT).frame(egui::Frame::NONE.fill(t.toolbar_bg)).show(ui, |ui| toolbar::show(app, ui));
     egui::Panel::bottom("edit_status").exact_size(22.0).frame(egui::Frame::NONE.fill(t.toolbar_bg)).show(ui, |ui| status_bar(app, ui));
+    egui::Panel::bottom("lower_dock_tabs").exact_size(22.0).frame(egui::Frame::NONE.fill(t.panel_bg2)).show(ui, |ui| dock_tabs(app, ui));
+    if app.ui.show_midi_editor {
+        egui::Panel::bottom("midi_editor").resizable(true).default_size(320.0).min_size(260.0).frame(egui::Frame::NONE.fill(t.panel_bg)).show(ui, |ui| crate::midi_editor::show(app, ui));
+    }
     if app.ui.show_tracks_list {
         egui::Panel::left("tracks_list")
             .exact_size(168.0)
@@ -46,6 +61,24 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         egui::Panel::right("clip_list").exact_size(230.0).frame(egui::Frame::NONE.fill(t.panel_bg)).show(ui, |ui| panels::clip_list(app, ui));
     }
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.window_bg)).show(ui, |ui| main_area(app, ui));
+}
+
+fn dock_tabs(app: &mut SoundApp, ui: &mut Ui) {
+    let t = Tokens::DARK;
+    let r = ui.max_rect();
+    let mut x = r.min.x + 10.0;
+    for (label, on, id) in [("MIDI EDITOR", app.ui.show_midi_editor, "window.midi_editor"), ("MEMORY LOCATIONS", app.ui.show_memory_locations, "window.memory_locations"), ("UNDO HISTORY", app.ui.show_undo_history, "window.undo_history")] {
+        let g = ui.painter().layout_no_wrap(label.to_string(), bold(10.5), if on { Color32::WHITE } else { t.text_dim });
+        let tr = Rect::from_min_size(pos2(x, r.min.y + 2.0), vec2(g.size().x + 16.0, r.height() - 4.0));
+        if on {
+            ui.painter().rect_filled(tr, 3.0, t.accent_dark);
+        }
+        ui.painter().galley(pos2(tr.min.x + 8.0, tr.center().y - g.size().y * 0.5), g, Color32::WHITE);
+        if ui.interact(tr, ui.id().with(("dock", label)), Sense::click()).clicked() {
+            let _ = app.run(id, json!({}));
+        }
+        x = tr.max.x + 6.0;
+    }
 }
 
 fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
@@ -81,8 +114,9 @@ fn main_area(app: &mut SoundApp, ui: &mut Ui) {
     let rulers: Vec<String> = app.engine.session().edit.rulers.clone();
     let rulers_h = RULER_H * rulers.len() as f32 + 6.0;
     let hscroll_h = 14.0;
-    let header = Rect::from_min_max(full.min, pos2(full.min.x + HEADER_W, full.max.y - hscroll_h));
-    let tl = Rect::from_min_max(pos2(full.min.x + HEADER_W, full.min.y + rulers_h), pos2(full.max.x - 12.0, full.max.y - hscroll_h));
+    let hw = header_width(app.engine.session());
+    let header = Rect::from_min_max(full.min, pos2(full.min.x + hw, full.max.y - hscroll_h));
+    let tl = Rect::from_min_max(pos2(full.min.x + hw, full.min.y + rulers_h), pos2(full.max.x - 12.0, full.max.y - hscroll_h));
     let rulers_rect = Rect::from_min_max(pos2(full.min.x, full.min.y), pos2(full.max.x, full.min.y + rulers_h));
     app.edit_layout.timeline = [tl.min.x, tl.min.y, tl.max.x, tl.max.y];
     ui.painter().rect_filled(full, 0.0, t.window_bg);
@@ -410,6 +444,11 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
     let Some(track) = s.track(id).cloned() else { return };
     let selected = s.edit.selected_tracks.contains(&id);
     let head = Rect::from_min_max(row.min, pos2(row.min.x + HEADER_W, row.max.y));
+    let cols = edit_columns(app.engine.session());
+    for (i, c) in cols.iter().enumerate() {
+        let cr = Rect::from_min_size(pos2(head.max.x + i as f32 * COLUMN_W, row.min.y), vec2(COLUMN_W, row.height()));
+        header_column(app, ui, &track, c, cr);
+    }
     let lane = Rect::from_min_max(pos2(tl.min.x, row.min.y), pos2(tl.max.x, row.max.y));
     // Header background.
     ui.painter().rect_filled(head, 0.0, if selected { Color32::from_rgb(52, 58, 66) } else { t.panel_bg2 });
@@ -476,7 +515,13 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         Stroke::new(1.0, Color32::from_rgb(20, 20, 20)),
         StrokeKind::Inside,
     );
-    ui.painter().with_clip_rect(name_r).text(name_r.center(), Align2::CENTER_CENTER, &track.name, bold(12.0), t.text_dark);
+    let shown_name = if app.engine.session().edit.flag("view.track_number") {
+        let n = app.engine.session().track_index(id).map_or(0, |i| i + 1);
+        format!("{n}  {}", track.name)
+    } else {
+        track.name.clone()
+    };
+    ui.painter().with_clip_rect(name_r).text(name_r.center(), Align2::CENTER_CENTER, &shown_name, bold(12.0), t.text_dark);
     let nresp = ui.interact(name_r, ui.id().with(("name", id.0)), Sense::click());
     if nresp.double_clicked() {
         app.dialogs.open_rename_track(id, &track.name);
@@ -598,6 +643,57 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
     }
 }
 
+/// One optional Edit-window column for a track (I/O, inserts, sends, comments).
+fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: Rect) {
+    let t = Tokens::DARK;
+    ui.painter().rect_filled(r, 0.0, t.panel_bg);
+    ui.painter().line_segment([pos2(r.min.x, r.min.y), pos2(r.min.x, r.max.y)], Stroke::new(1.0, t.border));
+    let line_h = 15.0;
+    let rows = ((r.height() - 4.0) / line_h).floor().max(1.0) as usize;
+    let item = |i: usize| Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 3.0 + i as f32 * line_h), vec2(r.width() - 8.0, line_h - 2.0));
+    let text = |ui: &Ui, rr: Rect, s: &str, c: Color32| {
+        ui.painter().rect_filled(rr, 2.0, t.slot_bg);
+        ui.painter().with_clip_rect(rr).text(pos2(rr.min.x + 4.0, rr.center().y), Align2::LEFT_CENTER, s, regular(10.0), c);
+    };
+    let route = |r: &soundcraft_model::Route| match r {
+        soundcraft_model::Route::None => "none".to_string(),
+        soundcraft_model::Route::Main => "Out 1-2".to_string(),
+        soundcraft_model::Route::Bus(b) => app.engine.session().bus(*b).map_or("bus".into(), |b| b.name.clone()),
+        soundcraft_model::Route::Hardware(h) => h.clone(),
+    };
+    match col {
+        "io" => {
+            if rows >= 1 {
+                text(ui, item(0), &format!("in: {}", route(&track.mixer.input)), t.text);
+            }
+            if rows >= 2 {
+                text(ui, item(1), &format!("out: {}", route(&track.mixer.output)), t.text);
+            }
+        }
+        "inserts_ae" | "inserts_fj" => {
+            let off = if col == "inserts_ae" { 0 } else { 5 };
+            for i in 0..5.min(rows) {
+                let name = track.mixer.inserts.get(off + i).cloned().flatten().and_then(|x| soundcraft_dsp::plugin_info(&x.plugin).map(|p| p.name)).unwrap_or("");
+                text(ui, item(i), name, t.text);
+            }
+        }
+        "sends_ae" | "sends_fj" => {
+            let off = if col == "sends_ae" { 0 } else { 5 };
+            for i in 0..5.min(rows) {
+                let s = track.mixer.sends.get(off + i).cloned().flatten().map(|x| format!("{} {:.0}", route(&x.target), x.level_db.max(-99.0))).unwrap_or_default();
+                text(ui, item(i), &s, t.text);
+            }
+        }
+        _ => {
+            let mut c = track.comments.clone();
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(3.0)));
+            if child.add(egui::TextEdit::multiline(&mut c).desired_width(r.width() - 6.0).font(regular(10.0))).changed() {
+                let _ = app.run("track.comments", json!({"track": track.id.0, "comments": c}));
+            }
+        }
+    }
+}
+
 fn view_label(v: &str) -> String {
     match AutoParam::parse(v) {
         Some(p) => p.label(),
@@ -716,7 +812,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         wave = Color32::from_rgb(70, 70, 70);
     }
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
-    let name_h = if lane.height() >= 40.0 { 13.0 } else { 0.0 };
+    let name_h = if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
     if name_h > 0.0 {
         let nb = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + name_h));
         painter.rect_filled(nb, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, if clip.muted { Color32::from_rgb(70, 70, 70) } else { bar });
@@ -737,6 +833,9 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 let nch = track.channels().min(audio.peaks.len().max(1)).max(1);
                 let ch_h = body_r.height() / nch as f32;
                 let zoom = s.edit.zoom.waveform_zoom;
+                let rectified = s.edit.flag("waveform.rectified");
+                let power = s.edit.flag("waveform.power");
+                let outlines = s.edit.flag("waveform.outlines");
                 let cols = vis.width().max(0.0) as usize;
                 if cols > 0 && vis.height() > 2.0 {
                     let a = (offset + sample_at(s, tl, vis.min.x) - clip.start) as f64;
@@ -751,8 +850,22 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                             let x = vis.min.x + i as f32;
                             let rel = sample_at(s, tl, x) - clip.start;
                             let g = clip.gain_at(rel.clamp(0, clip.length));
-                            let top = cy - (mx * g * zoom).clamp(-1.0, 1.0) * half;
-                            let bot = cy - (mn * g * zoom).clamp(-1.0, 1.0) * half;
+                            let (mut top, mut bot) = if rectified {
+                                let a = (mx.abs().max(mn.abs()) * g * zoom).clamp(0.0, 1.0);
+                                let b = cy + half;
+                                (b - a * half * 2.0, b)
+                            } else {
+                                (cy - (mx * g * zoom).clamp(-1.0, 1.0) * half, cy - (mn * g * zoom).clamp(-1.0, 1.0) * half)
+                            };
+                            if power {
+                                // Power view: compress peaks logarithmically around the centre.
+                                let k = |y: f32| cy + (y - cy).signum() * ((y - cy).abs() / half).sqrt() * half;
+                                top = k(top);
+                                bot = k(bot);
+                            }
+                            if outlines {
+                                bot = top + 1.0;
+                            }
                             let bot = if (bot - top) < 1.0 { top + 1.0 } else { bot };
                             let idx = mesh.vertices.len() as u32;
                             mesh.colored_vertex(pos2(x, top), wave);

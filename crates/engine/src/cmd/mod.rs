@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 mod audiosuite;
 mod clip;
+mod midi;
 mod edit;
 mod event;
 mod file;
@@ -93,6 +94,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(transport::specs());
         v.extend(query::specs());
         v.extend(audiosuite::specs());
+        v.extend(midi::specs());
         v
     })
 }
