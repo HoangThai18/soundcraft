@@ -26,7 +26,7 @@ use vst3::Steinberg::Vst::{
     IHostApplicationTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
 use vst3::Steinberg::{self as sb};
-use vst3::Steinberg::{FUnknown, IBStreamTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
+use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 /// Most classes one factory may report (hostile-input cap).
@@ -41,8 +41,13 @@ const MAX_BUS_CHANNELS: u32 = 64;
 pub(crate) const EVENT_CAP: usize = 1024;
 /// Most parameter queues per block (preallocated).
 pub(crate) const PARAM_QUEUE_CAP: usize = 1024;
-/// Largest plugin state we buffer when syncing the controller to the component.
+/// Largest plugin state we buffer (component or controller state).
 const MAX_STATE_BYTES: usize = 64 << 20;
+/// Most editor parameter edits buffered between two UI frames.
+const EDIT_CAP: usize = 256;
+/// Magic of SoundCraft's state container: `SCV3` + u32 LE component length + component state +
+/// u32 LE controller length + controller state.
+const STATE_MAGIC: &[u8; 4] = b"SCV3";
 
 // ---- strings -------------------------------------------------------------------------------
 
@@ -322,6 +327,7 @@ impl Bundle {
             // SAFETY: `ProcessContext` is plain data (numbers and small structs); all-zero is valid.
             context: unsafe { std::mem::zeroed() },
             event_in: false,
+            editor: Arc::new(EditorLink::default()),
             component,
             host,
             _bundle: self.clone(),
@@ -364,6 +370,7 @@ impl Bundle {
                 // SAFETY: valid controller; the handler (host context) outlives it.
                 unsafe { c.setComponentHandler(h.as_ptr()) };
             }
+            inst.editor = Arc::new(EditorLink { inner: Mutex::new(EditorInner { controller: Some(c.clone()), ..EditorInner::default() }) });
         }
         Ok(inst)
     }
@@ -386,12 +393,33 @@ pub(crate) fn hex(cid: &[u8; 16]) -> String {
 // ---- host-side COM objects -----------------------------------------------------------------
 
 /// The host context handed to `initialize` (`IHostApplication`) and to the controller
-/// (`IComponentHandler`: plugin-side parameter edits are accepted and ignored, SoundCraft's
-/// session is the source of truth).
-#[derive(Default)]
+/// (`IComponentHandler`: parameter edits made in the plugin's editor are queued for the UI, which
+/// writes them into the session, from where they reach the processor).
 pub(crate) struct HostContext {
     pub latency_changed: AtomicBool,
     pub restart_requested: AtomicBool,
+    /// `performEdit` values (normalized), bounded by `EDIT_CAP`.
+    pub edits: Mutex<Vec<(u32, f64)>>,
+}
+
+impl Default for HostContext {
+    fn default() -> Self {
+        HostContext {
+            latency_changed: AtomicBool::new(false),
+            restart_requested: AtomicBool::new(false),
+            edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+        }
+    }
+}
+
+impl HostContext {
+    /// Takes the queued editor edits.
+    pub fn take_edits(&self) -> Vec<(u32, f64)> {
+        let mut e = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = e.clone();
+        e.clear();
+        out
+    }
 }
 
 impl Class for HostContext {
@@ -424,7 +452,16 @@ impl IComponentHandlerTrait for HostContext {
     unsafe fn beginEdit(&self, _id: sv::ParamID) -> sb::tresult {
         sb::kResultOk
     }
-    unsafe fn performEdit(&self, _id: sv::ParamID, _value: sv::ParamValue) -> sb::tresult {
+    unsafe fn performEdit(&self, id: sv::ParamID, value: sv::ParamValue) -> sb::tresult {
+        if value.is_finite() {
+            let mut e = self.edits.lock().unwrap_or_else(PoisonError::into_inner);
+            let v = value.clamp(0.0, 1.0);
+            if let Some(x) = e.iter_mut().find(|(i, _)| *i == id) {
+                x.1 = v;
+            } else if e.len() < EDIT_CAP {
+                e.push((id, v));
+            }
+        }
         sb::kResultOk
     }
     unsafe fn endEdit(&self, _id: sv::ParamID) -> sb::tresult {
@@ -625,6 +662,14 @@ impl Class for MemoryStream {
 }
 
 impl MemoryStream {
+    fn new(data: Vec<u8>) -> ComWrapper<MemoryStream> {
+        ComWrapper::new(MemoryStream { inner: Mutex::new((data, 0)) })
+    }
+
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut self.lock().0)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, (Vec<u8>, usize)> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -844,6 +889,7 @@ pub(crate) struct Instance {
     out_events: ComWrapper<EventList>,
     context: sv::ProcessContext,
     event_in: bool,
+    editor: Arc<EditorLink>,
     // Field order matters for drop: `Drop::drop` shuts the plugin down first; then the component
     // and host objects are released, and the bundle (which keeps the code mapped) goes last.
     component: ComPtr<sv::IComponent>,
@@ -864,6 +910,68 @@ impl Instance {
 
     pub fn host(&self) -> &HostContext {
         &self.host
+    }
+
+    /// A counted reference to the host context (editor handles read its edit queue).
+    pub fn host_ref(&self) -> ComWrapper<HostContext> {
+        self.host.clone()
+    }
+
+    /// The editor link shared with editor handles (`None` without an edit controller).
+    pub fn editor(&self) -> Option<Arc<EditorLink>> {
+        self.editor.has_controller().then(|| Arc::clone(&self.editor))
+    }
+
+    /// Writes one state into a fresh memory stream.
+    fn read_state(f: impl FnOnce(*mut sb::IBStream) -> sb::tresult) -> Option<Vec<u8>> {
+        let stream = MemoryStream::new(Vec::new());
+        let s = stream.as_com_ref::<sb::IBStream>()?;
+        ok(f(s.as_ptr())).then(|| stream.take())
+    }
+
+    /// The component state plus the controller state, in SoundCraft's container (see
+    /// `STATE_MAGIC`). `None` when the component refuses `getState`.
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        // SAFETY: valid component; the stream lives in `read_state` for the whole call.
+        let comp = Instance::read_state(|s| unsafe { self.component.getState(s) })?;
+        let ctrl = match &self.controller {
+            // SAFETY: valid controller; as above.
+            Some(c) => Instance::read_state(|s| unsafe { c.getState(s) }).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut out = Vec::with_capacity(12 + comp.len() + ctrl.len());
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&u32::try_from(comp.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(&comp);
+        out.extend_from_slice(&u32::try_from(ctrl.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(&ctrl);
+        Some(out)
+    }
+
+    /// Restores a [`Instance::save_state`] blob (or a bare component state): component
+    /// `setState`, then the controller's `setComponentState` and `setState`. `false` when the
+    /// blob is malformed or the component refuses it.
+    pub fn load_state(&self, data: &[u8]) -> bool {
+        let Some((comp, ctrl)) = split_state(data) else { return false };
+        let stream = MemoryStream::new(comp.to_vec());
+        let Some(s) = stream.as_com_ref::<sb::IBStream>() else { return false };
+        // SAFETY: valid component; the stream lives on this frame for the call.
+        if !ok(unsafe { self.component.setState(s.as_ptr()) }) {
+            return false;
+        }
+        if let Some(c) = &self.controller {
+            stream.lock().1 = 0;
+            // SAFETY: valid controller; the same stream, rewound.
+            unsafe { c.setComponentState(s.as_ptr()) };
+            if !ctrl.is_empty() {
+                let cs = MemoryStream::new(ctrl.to_vec());
+                if let Some(r) = cs.as_com_ref::<sb::IBStream>() {
+                    // SAFETY: valid controller; the stream lives on this frame for the call.
+                    unsafe { c.setState(r.as_ptr()) };
+                }
+            }
+        }
+        true
     }
 
     /// Copies the component's state into the controller (`getState` → `setComponentState`).
@@ -1148,6 +1256,8 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // Close any editor and cut its handles off before the controller goes away.
+        self.editor.kill();
         self.shutdown();
         if let Some((a, b)) = self.connections.take() {
             // SAFETY: the pair was connected in `instantiate`; disconnect before terminating.
@@ -1173,9 +1283,408 @@ impl Drop for Instance {
     }
 }
 
+/// Splits a state blob into (component, controller) parts. A blob without SoundCraft's container
+/// header is taken as a bare component state.
+fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    if data.len() > MAX_STATE_BYTES.saturating_mul(2) {
+        return None;
+    }
+    let Some(rest) = data.strip_prefix(STATE_MAGIC) else { return (!data.is_empty()).then_some((data, &[][..])) };
+    let take = |b: &[u8]| -> Option<(usize, usize)> {
+        let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
+        (n <= MAX_STATE_BYTES && b.len() >= 4 + n).then_some((4, 4 + n))
+    };
+    let (a, b) = take(rest)?;
+    let comp = rest.get(a..b)?;
+    let rest = rest.get(b..)?;
+    let (c, d) = take(rest)?;
+    let ctrl = rest.get(c..d)?;
+    (d == rest.len()).then_some((comp, ctrl))
+}
+
+// ---- editor (IPlugView) --------------------------------------------------------------------
+
+/// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window.
+pub(crate) struct PlugFrame {
+    /// The host window (an `NSWindow*` on macOS), not owned; null when there is none.
+    window: std::sync::atomic::AtomicPtr<c_void>,
+}
+
+impl Class for PlugFrame {
+    type Interfaces = (sb::IPlugFrame,);
+}
+
+impl IPlugFrameTrait for PlugFrame {
+    unsafe fn resizeView(&self, view: *mut sb::IPlugView, new_size: *mut sb::ViewRect) -> sb::tresult {
+        // SAFETY: in-pointer from the plugin (or null, handled).
+        let Some(r) = (unsafe { new_size.as_mut() }) else { return sb::kInvalidArgument };
+        let (w, h) = rect_size(r);
+        window::resize(self.window.load(Ordering::Relaxed), w, h);
+        // SAFETY: the plugin passes its own live view (or null, handled).
+        if let Some(v) = unsafe { vst3::ComRef::from_raw(view) } {
+            // SAFETY: valid view; `r` is the plugin's own writable rect.
+            unsafe { v.onSize(r) };
+        }
+        sb::kResultOk
+    }
+}
+
+/// Width and height of a view rect, clamped to a sane window size.
+fn rect_size(r: &sb::ViewRect) -> (f64, f64) {
+    let w = r.right.saturating_sub(r.left).clamp(1, 16_384);
+    let h = r.bottom.saturating_sub(r.top).clamp(1, 16_384);
+    (f64::from(w), f64::from(h))
+}
+
+#[derive(Default)]
+struct EditorInner {
+    /// `None` once the instance is gone.
+    controller: Option<ComPtr<sv::IEditController>>,
+    view: Option<ComPtr<sb::IPlugView>>,
+    frame: Option<ComWrapper<PlugFrame>>,
+    window: Option<window::HostWindow>,
+}
+
+/// The link between an instance and its editor handles. The instance may process on the audio
+/// thread while the editor (the edit controller's `IPlugView`) is driven from the main thread,
+/// which is VST3's own threading model (controller and views on the UI thread). All view calls
+/// happen under this lock, and the instance closes the view and drops the controller reference
+/// under the same lock before it terminates, so a handle never calls into a dead plugin.
+#[derive(Default)]
+pub(crate) struct EditorLink {
+    inner: Mutex<EditorInner>,
+}
+
+impl EditorLink {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EditorInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn has_controller(&self) -> bool {
+        self.lock().controller.is_some()
+    }
+
+    fn create_view(g: &EditorInner) -> Result<ComPtr<sb::IPlugView>, String> {
+        let c = g.controller.as_ref().ok_or_else(|| "the plugin is gone".to_string())?;
+        // SAFETY: valid controller; the name is a static NUL-terminated string.
+        let raw = unsafe { c.createView(c"editor".as_ptr()) };
+        // SAFETY: a non-null view comes with one reference owned by the caller.
+        unsafe { ComPtr::from_raw(raw) }.ok_or_else(|| "this plugin has no editor".to_string())
+    }
+
+    /// Creates the view, checks it supports this platform's window type and reads its size,
+    /// without attaching it anywhere. For diagnostics and tests.
+    pub fn probe(&self) -> Result<(u32, u32), String> {
+        let g = self.lock();
+        let view = EditorLink::create_view(&g)?;
+        let platform = window::PLATFORM_TYPE.ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
+        // SAFETY: valid view; `platform` is a static NUL-terminated string.
+        if unsafe { view.isPlatformTypeSupported(platform) } != sb::kResultTrue {
+            return Err("the editor does not support this platform's windows".into());
+        }
+        let mut r = sb::ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: valid view; `r` is writable.
+        if !ok(unsafe { view.getSize(&mut r) }) {
+            return Err("the editor reports no size".into());
+        }
+        let (w, h) = rect_size(&r);
+        Ok((w as u32, h as u32))
+    }
+
+    /// Opens (or raises) the editor in a host window. Main thread only.
+    pub fn open(&self, title: &str) -> Result<(), String> {
+        if !window::on_main_thread() {
+            return Err("plugin editors must be opened on the main thread".into());
+        }
+        let platform = window::PLATFORM_TYPE.ok_or_else(|| "VST3 editors are not hosted on this platform yet".to_string())?;
+        let mut g = self.lock();
+        if let Some(w) = &g.window {
+            if w.is_visible() {
+                w.raise();
+                return Ok(());
+            }
+            // The user closed the window: start over.
+            EditorLink::teardown(&mut g);
+        }
+        let view = EditorLink::create_view(&g)?;
+        // SAFETY: valid view; `platform` is a static NUL-terminated string.
+        if unsafe { view.isPlatformTypeSupported(platform) } != sb::kResultTrue {
+            return Err("the editor does not support this platform's windows".into());
+        }
+        let mut r = sb::ViewRect { left: 0, top: 0, right: 400, bottom: 300 };
+        // SAFETY: valid view; `r` is writable. On failure the default size stays.
+        unsafe { view.getSize(&mut r) };
+        let (w, h) = rect_size(&r);
+        let win = window::HostWindow::new(title, w, h)?;
+        let frame = ComWrapper::new(PlugFrame { window: std::sync::atomic::AtomicPtr::new(win.raw()) });
+        if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
+            // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
+            // and detached in `teardown`).
+            unsafe { view.setFrame(f.as_ptr()) };
+        }
+        // SAFETY: valid view; the parent is the live content view of `win`, of the type named.
+        if !ok(unsafe { view.attached(win.parent(), platform) }) {
+            // SAFETY: valid view; detach our frame again.
+            unsafe { view.setFrame(std::ptr::null_mut()) };
+            win.close();
+            return Err("the editor could not attach to its window".into());
+        }
+        win.raise();
+        g.view = Some(view);
+        g.frame = Some(frame);
+        g.window = Some(win);
+        Ok(())
+    }
+
+    fn teardown(g: &mut EditorInner) {
+        if let Some(view) = g.view.take() {
+            // SAFETY: valid, attached view; main thread (callers check). `removed` before the
+            // window goes, and the frame is detached before it is released.
+            unsafe {
+                view.removed();
+                view.setFrame(std::ptr::null_mut());
+            }
+        }
+        g.frame = None;
+        if let Some(w) = g.window.take() {
+            w.close();
+        }
+    }
+
+    /// Closes the editor. Main thread only (no-op elsewhere).
+    pub fn close(&self) {
+        if window::on_main_thread() {
+            EditorLink::teardown(&mut self.lock());
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        let g = self.lock();
+        match &g.window {
+            Some(w) if window::on_main_thread() => w.is_visible(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Main-thread housekeeping: tears the view down when the user closed its window.
+    pub fn idle(&self) {
+        if !window::on_main_thread() {
+            return;
+        }
+        let mut g = self.lock();
+        if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
+            EditorLink::teardown(&mut g);
+        }
+    }
+
+    /// Normalized → plain through the controller (main thread).
+    pub fn to_plain(&self, id: u32, n: f64) -> Option<f64> {
+        let g = self.lock();
+        let c = g.controller.as_ref()?;
+        // SAFETY: valid controller.
+        let v = unsafe { c.normalizedParamToPlain(id, n.clamp(0.0, 1.0)) };
+        v.is_finite().then_some(v)
+    }
+
+    /// Plain → normalized through the controller (main thread).
+    pub fn to_normalized(&self, id: u32, plain: f64) -> Option<f64> {
+        let g = self.lock();
+        let c = g.controller.as_ref()?;
+        if !plain.is_finite() {
+            return None;
+        }
+        // SAFETY: valid controller.
+        let v = unsafe { c.plainParamToNormalized(id, plain) };
+        v.is_finite().then(|| v.clamp(0.0, 1.0))
+    }
+
+    /// Shows a value change in the editor (`setParamNormalized`, main thread).
+    pub fn set_normalized(&self, id: u32, n: f64) {
+        if !window::on_main_thread() || !n.is_finite() {
+            return;
+        }
+        let g = self.lock();
+        if let Some(c) = &g.controller {
+            // SAFETY: valid controller, main thread.
+            unsafe { c.setParamNormalized(id, n.clamp(0.0, 1.0)) };
+        }
+    }
+
+    /// Called by the instance before it terminates: closes the editor and cuts the handles off.
+    fn kill(&self) {
+        let mut g = self.lock();
+        if g.view.is_some() || g.window.is_some() {
+            if window::on_main_thread() {
+                EditorLink::teardown(&mut g);
+            } else {
+                // Window calls are main-thread only; leak the view and window rather than crash.
+                log::warn!("vst3: editor still open while its plugin is destroyed off the main thread");
+                if let Some(v) = g.view.take() {
+                    std::mem::forget(v);
+                }
+                // `HostWindow` has no destructor: dropping it leaks its retain on purpose.
+                g.window = None;
+                if let Some(f) = g.frame.take() {
+                    std::mem::forget(f);
+                }
+            }
+        }
+        g.controller = None;
+    }
+}
+
+/// The platform host window for plugin views.
+#[cfg(target_os = "macos")]
+mod window {
+    use objc2::rc::Retained;
+    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSApplication, NSBackingStoreType, NSFloatingWindowLevel, NSWindow, NSWindowStyleMask};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+    use std::ffi::{c_char, c_void};
+
+    pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeNSView);
+
+    pub fn on_main_thread() -> bool {
+        MainThreadMarker::new().is_some()
+    }
+
+    /// An `NSWindow` (titled, closable, floating above the app's windows) whose content view is
+    /// the plugin view's parent. Holds one retain of the window; main thread only.
+    pub struct HostWindow {
+        window: *mut NSWindow,
+    }
+
+    // SAFETY: the pointer is only dereferenced on the main thread (every method checks
+    // `MainThreadMarker`); the struct merely carries the retain between threads' locks.
+    unsafe impl Send for HostWindow {}
+
+    impl HostWindow {
+        fn get(&self) -> Option<&NSWindow> {
+            MainThreadMarker::new()?;
+            // SAFETY: we hold a retain of this window (from `new`) until `close`.
+            unsafe { self.window.as_ref() }
+        }
+
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            let mtm = MainThreadMarker::new().ok_or_else(|| "not on the main thread".to_string())?;
+            let _app = NSApplication::sharedApplication(mtm);
+            let rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(w, h));
+            let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
+            // SAFETY: a freshly allocated window on the main thread; valid rect and style.
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), rect, style, NSBackingStoreType::Buffered, false)
+            };
+            // SAFETY: we keep our own retain and release it in `close`, so AppKit must not
+            // release the window when the user closes it.
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.setTitle(&NSString::from_str(title));
+            window.setLevel(NSFloatingWindowLevel);
+            window.setHidesOnDeactivate(true);
+            window.center();
+            Ok(HostWindow { window: Retained::into_raw(window) })
+        }
+
+        /// The raw window pointer (for the plug frame's resizes).
+        pub fn raw(&self) -> *mut c_void {
+            self.window.cast()
+        }
+
+        /// The content view (`NSView*`) the plugin view attaches to; null when unavailable.
+        pub fn parent(&self) -> *mut c_void {
+            self.get().and_then(|w| w.contentView()).map_or(std::ptr::null_mut(), |v| Retained::as_ptr(&v).cast_mut().cast())
+        }
+
+        pub fn raise(&self) {
+            if let Some(w) = self.get() {
+                w.makeKeyAndOrderFront(None);
+            }
+        }
+
+        pub fn is_visible(&self) -> bool {
+            self.get().is_some_and(|w| w.isVisible())
+        }
+
+        pub fn close(self) {
+            if let Some(w) = self.get() {
+                w.orderOut(None);
+                w.close();
+            }
+            if MainThreadMarker::new().is_some() {
+                // SAFETY: balances the retain taken in `new`; nothing uses the pointer after this.
+                drop(unsafe { Retained::from_raw(self.window) });
+            }
+        }
+    }
+
+    /// Resizes a host window's content (`window` from [`HostWindow::raw`]); main thread only.
+    pub fn resize(window: *mut c_void, w: f64, h: f64) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        // SAFETY: null or a window the editor link keeps retained while the frame is attached.
+        if let Some(win) = unsafe { window.cast::<NSWindow>().as_ref() } {
+            win.setContentSize(NSSize::new(w, h));
+        }
+    }
+}
+
+/// Other platforms: no editor windows yet (opening reports "unsupported").
+#[cfg(not(target_os = "macos"))]
+mod window {
+    use std::ffi::{c_char, c_void};
+
+    pub const PLATFORM_TYPE: Option<*const c_char> = None;
+
+    pub fn on_main_thread() -> bool {
+        true
+    }
+
+    pub struct HostWindow;
+
+    impl HostWindow {
+        pub fn new(_title: &str, _w: f64, _h: f64) -> Result<HostWindow, String> {
+            Err("VST3 editors are not hosted on this platform yet".into())
+        }
+        pub fn raw(&self) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        pub fn parent(&self) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        pub fn raise(&self) {}
+        pub fn is_visible(&self) -> bool {
+            false
+        }
+        pub fn close(self) {}
+    }
+
+    pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_container_parses_strictly() {
+        let mut blob = b"SCV3".to_vec();
+        blob.extend_from_slice(&3u32.to_le_bytes());
+        blob.extend_from_slice(b"abc");
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(b"xy");
+        assert_eq!(split_state(&blob), Some((&b"abc"[..], &b"xy"[..])));
+        assert_eq!(split_state(b"raw component"), Some((&b"raw component"[..], &[][..])), "bare component state");
+        assert_eq!(split_state(b""), None);
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        assert_eq!(split_state(&trailing), None);
+        assert_eq!(split_state(&blob[..blob.len() - 1]), None);
+        let mut huge = b"SCV3".to_vec();
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(split_state(&huge), None);
+        assert_eq!(split_state(b"SCV3"), None);
+    }
 
     #[test]
     fn strings_are_bounded() {

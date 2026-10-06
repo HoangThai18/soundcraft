@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod automation;
+pub mod b64;
 mod clip;
 mod ids;
 mod markers;
@@ -22,7 +23,7 @@ pub use mixer::{
     Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
 };
 pub use session::{BitDepthSetting, EditMode, EditState, SESSION_EXTENSION, Session, SessionError, Tool, TrackView, ZoomState};
-pub use source::{Source, SourceAudio, SourcePool};
+pub use source::{Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};
 
 pub use soundcraft_time as time;

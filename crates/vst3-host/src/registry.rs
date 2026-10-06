@@ -225,10 +225,14 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
 }
 
 pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
+    Ok(Box::new(instantiate_plugin(id)?))
+}
+
+pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
     let (inst, info) = instantiate_raw(id)?;
     let mut p = Vst3Plugin::new(inst, info);
     p.prepare(48_000.0, 1024, 2);
-    Ok(Box::new(p))
+    Ok(p)
 }
 
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {

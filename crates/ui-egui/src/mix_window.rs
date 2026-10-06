@@ -23,7 +23,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             .show(ui, |ui| panels::tracks_and_groups(app, ui));
     }
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.window_bg)).show(ui, |ui| {
-        let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden).map(|x| x.id).collect();
+        let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden && x.kind != TrackKind::Video).map(|x| x.id).collect();
         // Per-channel peaks for multichannel meters (read once per frame).
         let snap = app
             .player
@@ -376,6 +376,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         TrackKind::Instrument => "inst",
         TrackKind::Vca => "vca",
         TrackKind::Folder => "folder",
+        TrackKind::Video => "video",
     };
     ui.painter().text(pos2(vr.center().x, vr.max.y + 9.0), Align2::CENTER_CENTER, kind, regular(9.5), t.text_dim);
     let nr = Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 18.0));
@@ -480,11 +481,29 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
             }
         }
     });
+    // Audio Units (macOS; scanned once, cached by soundcraft-au-host).
+    if cfg!(target_os = "macos") {
+        ui.menu_button("Audio Units", |ui| {
+            let found: Vec<_> = soundcraft_au_host::scan().into_iter().filter(|d| !d.is_instrument).collect();
+            if found.is_empty() {
+                ui.label("No Audio Units found");
+            }
+            for d in found {
+                if ui.button(format!("{} ({})", d.name, d.vendor)).clicked() {
+                    let _ = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": d.id}));
+                }
+            }
+        });
+    }
 }
 
-/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`) or VST3 (`vst3:<class id>`) plugin's.
+/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
+/// Audio Unit (`au:<type>:<subtype>:<manufacturer>`) plugin's.
 pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
-    soundcraft_dsp::plugin_info(id).or_else(|| soundcraft_clap_host::plugin_info(id)).or_else(|| soundcraft_vst3_host::plugin_info(id))
+    soundcraft_dsp::plugin_info(id)
+        .or_else(|| soundcraft_clap_host::plugin_info(id))
+        .or_else(|| soundcraft_vst3_host::plugin_info(id))
+        .or_else(|| soundcraft_au_host::plugin_info(id))
 }
 
 fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {

@@ -434,6 +434,10 @@ pub struct Insert {
     /// Preset name shown in the plugin window header.
     #[serde(default)]
     pub preset: String,
+    /// Opaque plugin state (third-party plugins: CLAP state / VST3 component + controller
+    /// state), standard base64. Restored into a new instance before it first processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 fn yes() -> bool {
@@ -442,7 +446,17 @@ fn yes() -> bool {
 
 impl Insert {
     pub fn new(plugin: impl Into<String>) -> Self {
-        Insert { plugin: plugin.into(), params: BTreeMap::new(), bypass: false, active: true, preset: String::from("<factory default>") }
+        Insert { plugin: plugin.into(), params: BTreeMap::new(), bypass: false, active: true, preset: String::from("<factory default>"), state: None }
+    }
+
+    /// The decoded plugin state (`None` when absent or malformed).
+    pub fn state_bytes(&self) -> Option<Vec<u8>> {
+        self.state.as_deref().and_then(crate::b64::decode)
+    }
+
+    /// Stores a plugin state blob (base64-encoded); an empty blob clears it.
+    pub fn set_state_bytes(&mut self, data: &[u8]) {
+        self.state = (!data.is_empty()).then(|| crate::b64::encode(data));
     }
 }
 
@@ -589,6 +603,26 @@ pub fn fader_db_to_pos(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_state_round_trips_through_json() {
+        let mut i = Insert::new("vst3:00");
+        assert_eq!(i.state_bytes(), None);
+        let blob: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        i.set_state_bytes(&blob);
+        let json = serde_json::to_string(&i).unwrap();
+        let back: Insert = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state_bytes().unwrap(), blob);
+        i.set_state_bytes(&[]);
+        assert_eq!(i.state, None);
+        // Old sessions have no `state`; stateless inserts don't write one.
+        let old: Insert = serde_json::from_str(r#"{"plugin":"eq_7band"}"#).unwrap();
+        assert_eq!(old.state, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("state"));
+        // A hostile state string decodes to nothing rather than failing the load.
+        let bad: Insert = serde_json::from_str(r#"{"plugin":"x","state":"!!!"}"#).unwrap();
+        assert_eq!(bad.state_bytes(), None);
+    }
 
     #[test]
     fn fader_taper_round_trips() {

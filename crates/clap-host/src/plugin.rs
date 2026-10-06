@@ -1,8 +1,9 @@
 //! `ClapPlugin`: a loaded CLAP instance behind the safe `soundcraft_dsp::Plugin` trait.
 
-use crate::ffi::{EVENT_CAP, Event, Instance, NotePort, PortBuffers};
+use crate::ffi::{EVENT_CAP, Event, GuiLink, Instance, NotePort, PortBuffers};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
-use soundcraft_dsp::{Plugin, PluginInfo};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Largest block we activate a plugin for.
@@ -60,6 +61,17 @@ impl ClapPlugin {
             latency: 0,
             steady: 0,
         }
+    }
+
+    /// Re-reads every parameter value from the plugin (after a state load).
+    fn refresh_values(&mut self) {
+        for ((v, p), id) in self.values.iter_mut().zip(self.info.params).zip(&self.ids) {
+            if let Some(x) = self.inst.param_value(*id) {
+                *v = p.clamp(x as f32);
+            }
+        }
+        // Pending changes from before the load would undo it.
+        self.queue.retain(|e| !matches!(e, Event::Param { .. }));
     }
 
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
@@ -242,5 +254,73 @@ impl Plugin for ClapPlugin {
                 self.note_off(0, k);
             }
         }
+    }
+
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self.inst.save_state()
+    }
+
+    fn load_state(&mut self, data: &[u8]) -> bool {
+        let ok = self.inst.load_state(data);
+        if ok {
+            self.refresh_values();
+        }
+        ok
+    }
+
+    fn open_editor(&mut self) -> Result<(), String> {
+        let link = self.inst.gui().ok_or_else(|| "this plugin has no editor".to_string())?;
+        link.open(self.info.name)
+    }
+
+    fn close_editor(&mut self) {
+        if let Some(link) = self.inst.gui() {
+            link.close();
+        }
+    }
+
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        let link = self.inst.gui()?;
+        Some(Box::new(ClapEditor { link, info: self.info, ids: self.ids.clone() }))
+    }
+}
+
+/// A CLAP plugin's floating editor, driven from the main thread (see [`GuiLink`]).
+struct ClapEditor {
+    link: Arc<GuiLink>,
+    info: &'static PluginInfo,
+    ids: Vec<u32>,
+}
+
+impl PluginEditor for ClapEditor {
+    fn open(&mut self) -> Result<(), String> {
+        // Edits reported before the editor opened are stale.
+        let _ = self.link.idle();
+        self.link.open(self.info.name)
+    }
+
+    fn close(&mut self) {
+        self.link.close();
+    }
+
+    fn is_open(&self) -> bool {
+        self.link.is_open()
+    }
+
+    fn idle(&mut self) -> Vec<(String, f32)> {
+        let raw = self.link.idle();
+        let _ = self.link.host().dirty.swap(false, Ordering::Relaxed);
+        let mut out: Vec<(String, f32)> = Vec::new();
+        for (cid, v) in raw {
+            let Some(i) = self.ids.iter().position(|&x| x == cid) else { continue };
+            let Some(p) = self.info.params.get(i) else { continue };
+            let v = p.clamp(v as f32);
+            // Keep only the latest value per parameter.
+            match out.iter_mut().find(|(id, _)| id == p.id) {
+                Some(e) => e.1 = v,
+                None => out.push((p.id.to_string(), v)),
+            }
+        }
+        out
     }
 }

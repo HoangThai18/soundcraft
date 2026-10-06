@@ -60,6 +60,9 @@ pub enum ClipContent {
     Audio { source: SourceId, offset: Samples },
     /// MIDI notes, with ticks relative to the clip start.
     Midi { sequence: Sequence },
+    /// Picture from the movie `source` ([`crate::VideoSource`], `Session::videos`), starting
+    /// `offset` samples into the movie. Video clips carry no audio.
+    Video { source: SourceId, offset: Samples },
 }
 
 /// A clip on a playlist.
@@ -137,6 +140,13 @@ impl Clip {
         c
     }
 
+    /// A clip showing the movie `source` from `offset` samples into it.
+    pub fn video(id: ClipId, name: impl Into<String>, source: SourceId, offset: Samples, start: Samples, length: Samples) -> Clip {
+        let mut c = Clip::audio(id, name, SourceId(0), 0, start, length);
+        c.content = ClipContent::Video { source, offset };
+        c
+    }
+
     pub fn end(&self) -> Samples {
         self.start.saturating_add(self.length)
     }
@@ -149,16 +159,30 @@ impl Clip {
         matches!(self.content, ClipContent::Audio { .. })
     }
 
+    pub fn is_video(&self) -> bool {
+        matches!(self.content, ClipContent::Video { .. })
+    }
+
+    /// The audio source this clip plays (None for MIDI and video clips).
     pub fn source(&self) -> Option<SourceId> {
         match self.content {
             ClipContent::Audio { source, .. } => Some(source),
-            ClipContent::Midi { .. } => None,
+            ClipContent::Midi { .. } | ClipContent::Video { .. } => None,
         }
     }
 
+    /// The movie this clip shows (video clips only).
+    pub fn video_source(&self) -> Option<SourceId> {
+        match self.content {
+            ClipContent::Video { source, .. } => Some(source),
+            ClipContent::Audio { .. } | ClipContent::Midi { .. } => None,
+        }
+    }
+
+    /// Offset into the audio file or movie (0 for MIDI).
     pub fn source_offset(&self) -> Samples {
         match self.content {
-            ClipContent::Audio { offset, .. } => offset,
+            ClipContent::Audio { offset, .. } | ClipContent::Video { offset, .. } => offset,
             ClipContent::Midi { .. } => 0,
         }
     }
@@ -184,7 +208,7 @@ impl Clip {
     pub fn trim_start_to(&mut self, new_start: Samples) {
         let new_start = new_start.min(self.end() - 1);
         let delta = new_start - self.start;
-        if let ClipContent::Audio { offset, .. } = &mut self.content {
+        if let ClipContent::Audio { offset, .. } | ClipContent::Video { offset, .. } = &mut self.content {
             *offset = offset.saturating_add(delta);
         }
         // MIDI note ticks are re-anchored by the engine, which knows the tempo map.

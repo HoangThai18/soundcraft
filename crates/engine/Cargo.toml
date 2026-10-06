@@ -16,6 +16,7 @@ soundcraft-clap-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
+soundcraft-video.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

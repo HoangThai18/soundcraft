@@ -19,6 +19,31 @@
 //! - sources whose format equals the destination's pass straight through, channel for channel;
 //! - other multichannel sources fold to stereo with ITU-R BS.775 coefficients (C and surrounds at
 //!   -3 dB, LFE dropped), or map speaker by speaker into other multichannel layouts.
+//!
+//! ## Plugin instances and threads
+//! [`MixEngine::sync`] brings plugin instances in line with the session. Built-in plugins are
+//! cheap (allocation only) and are always created there, on whichever thread renders. Hosted
+//! third-party plugins (`clap:` / `vst3:` ids, see [`is_third_party`]) are expensive and have
+//! main-thread rules, so a realtime host keeps them off the audio thread:
+//! - with [`MixEngine::set_external_instances`]`(true)` (realtime playback), `sync` never creates a
+//!   third-party plugin. The host's control (UI) thread creates them with [`create_instance`] from
+//!   [`instance_specs`] (restoring each insert's stored [`Insert::state`] and calling `prepare`
+//!   there), and hands them over with [`MixEngine::adopt`]; `sync` then moves the matching one
+//!   into its slot. A slot whose instance has not arrived yet passes audio through.
+//! - every instance `sync` replaces or removes (built-in or not) goes to a retired list instead of
+//!   being dropped; the host takes it with [`MixEngine::take_retired`] and drops it on the control
+//!   thread, so plugin destruction never runs on the audio thread either.
+//! - without external instances (the default: offline [`render_range`], bounces, tests) `sync`
+//!   creates third-party plugins itself, synchronously, restores their stored state before the
+//!   first `process`, and drops retired instances at the end of `sync`.
+//!
+//! An instance starts from its stored state; the insert's parameter values are then applied on
+//! top before the first block (the session's values are kept in step with the plugin, including
+//! edits made in its own editor, so both agree; the state carries everything else).
+//! [`MixEngine::capture_states`] reads every live instance's state back (for saving the session);
+//! it calls into the plugins and allocates, so a realtime host runs it only on request.
+//!
+//! [`Insert::state`]: soundcraft_model::Insert::state
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
@@ -36,6 +61,76 @@ pub const MAX_CHANNELS: usize = 16;
 /// Number of channels of a session's main mix.
 pub fn main_channels(s: &Session) -> usize {
     s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
+}
+
+/// Slot index used for a track's instrument plugin in [`InstanceSpec`], [`PreparedInstance`] and
+/// [`MixEngine::capture_states`] (insert slots use their index).
+pub const INSTRUMENT_SLOT: usize = usize::MAX;
+
+/// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
+pub fn is_third_party(id: &str) -> bool {
+    id.starts_with(soundcraft_clap_host::ID_PREFIX)
+        || id.starts_with(soundcraft_vst3_host::ID_PREFIX)
+        || id.starts_with(soundcraft_au_host::ID_PREFIX)
+}
+
+/// A third-party plugin instance a session needs: which slot, which plugin, how many channels,
+/// and the state to restore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceSpec {
+    pub track: TrackId,
+    /// Insert slot index, or [`INSTRUMENT_SLOT`].
+    pub slot: usize,
+    pub id: String,
+    /// Channel count the instance is prepared for.
+    pub ch: usize,
+    /// Decoded [`Insert::state`](soundcraft_model::Insert::state).
+    pub state: Option<Vec<u8>>,
+}
+
+/// A plugin instance created and prepared off the audio thread, handed to [`MixEngine::adopt`].
+pub struct PreparedInstance {
+    pub track: TrackId,
+    pub slot: usize,
+    pub id: String,
+    pub ch: usize,
+    pub plugin: Box<dyn Plugin>,
+}
+
+/// Every third-party plugin slot (inserts and instruments) of a session, with the channel count
+/// [`MixEngine::sync`] prepares it for. Inactive and master tracks are included (they have strips).
+pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
+    let main_ch = main_channels(s);
+    let mut out = Vec::new();
+    for t in &s.tracks {
+        let ch = strip_channels(t, main_ch);
+        for (i, ins) in t.mixer.inserts.iter().enumerate() {
+            if let Some(ins) = ins
+                && is_third_party(&ins.plugin)
+            {
+                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: ins.state_bytes() });
+            }
+        }
+        if let Some(ins) = &t.instrument
+            && is_third_party(&ins.plugin)
+        {
+            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: ins.state_bytes() });
+        }
+    }
+    out
+}
+
+/// Creates a plugin (built-in or hosted), restores `state` (if any) and prepares it. Expensive
+/// for third-party plugins: in realtime use, call it on the control thread.
+pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_block: usize, ch: usize) -> Option<Box<dyn Plugin>> {
+    let mut p = create_plugin(id)?;
+    if let Some(st) = state
+        && !p.load_state(st)
+    {
+        log::warn!("{id}: the plugin did not accept its stored state");
+    }
+    p.prepare(sample_rate, max_block, ch);
+    Some(p)
 }
 
 /// Peak meter values for one strip (linear, per channel, max over the last block).
@@ -204,6 +299,48 @@ pub struct MixEngine {
     pub monitor_only: bool,
     /// Recording: record-armed tracks hear their input (auto input).
     pub recording: bool,
+    /// Third-party instances come from [`MixEngine::adopt`] instead of being created in `sync`.
+    external: bool,
+    /// Instances handed over by the host, waiting for `sync` to place them.
+    adopt: HashMap<(TrackId, usize), PreparedInstance>,
+    /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
+    retired: Vec<Box<dyn Plugin>>,
+}
+
+/// What `sync` needs to fill a slot.
+struct SlotCtx<'a> {
+    sr: f32,
+    mb: usize,
+    external: bool,
+    adopt: &'a mut HashMap<(TrackId, usize), PreparedInstance>,
+    retired: &'a mut Vec<Box<dyn Plugin>>,
+}
+
+impl SlotCtx<'_> {
+    fn retire(&mut self, slot: Option<PluginSlot>) {
+        if let Some(s) = slot {
+            self.retired.push(s.plugin);
+        }
+    }
+
+    /// A new instance for `ins` on track `t`, slot `idx`, prepared for `ch` channels.
+    fn make(&mut self, t: TrackId, idx: usize, ins: &soundcraft_model::Insert, ch: usize) -> Option<PluginSlot> {
+        let third = is_third_party(&ins.plugin);
+        let plugin = if third && self.external {
+            match self.adopt.remove(&(t, idx)) {
+                Some(p) if p.id == ins.plugin && p.ch == ch => Some(p.plugin),
+                Some(p) => {
+                    self.retired.push(p.plugin);
+                    None
+                }
+                None => None,
+            }
+        } else {
+            let state = if third { ins.state_bytes() } else { None };
+            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)
+        }?;
+        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new() })
+    }
 }
 
 impl MixEngine {
@@ -226,7 +363,66 @@ impl MixEngine {
             input: Vec::new(),
             monitor_only: false,
             recording: false,
+            external: false,
+            adopt: HashMap::new(),
+            retired: Vec::new(),
         }
+    }
+
+    /// Realtime mode: third-party plugins are created by the host and handed over with
+    /// [`MixEngine::adopt`] instead of being created in `sync` (see the crate docs).
+    pub fn set_external_instances(&mut self, on: bool) {
+        self.external = on;
+    }
+
+    /// Takes instances created off the audio thread; the next render's `sync` places them.
+    /// An earlier instance waiting for the same slot is retired.
+    pub fn adopt(&mut self, instances: Vec<PreparedInstance>) {
+        for p in instances {
+            if let Some(old) = self.adopt.insert((p.track, p.slot), p) {
+                self.retired.push(old.plugin);
+            }
+        }
+        // Force a re-sync so waiting slots pick their instance up.
+        self.synced = (usize::MAX, usize::MAX, usize::MAX);
+    }
+
+    /// Instances taken out of service since the last call (drop them off the audio thread).
+    /// Does not allocate.
+    pub fn take_retired(&mut self) -> Vec<Box<dyn Plugin>> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Every instance this engine holds (strips, instruments, clip effects excluded) plus the
+    /// retired and waiting ones, leaving the engine empty: hand them to another thread to drop
+    /// before replacing the engine.
+    pub fn drain_plugins(&mut self) -> Vec<Box<dyn Plugin>> {
+        let mut out = std::mem::take(&mut self.retired);
+        for st in self.strips.values_mut() {
+            out.extend(st.plugins.iter_mut().filter_map(Option::take).map(|s| s.plugin));
+            out.extend(st.instrument.take().map(|s| s.plugin));
+        }
+        out.extend(self.adopt.drain().map(|(_, p)| p.plugin));
+        self.synced = (usize::MAX, usize::MAX, usize::MAX);
+        out
+    }
+
+    /// The state of every live plugin that has one (third-party plugins), as
+    /// `(track, slot or INSTRUMENT_SLOT, state)`. Calls into the plugins and allocates.
+    pub fn capture_states(&mut self) -> Vec<(TrackId, usize, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (tid, st) in self.strips.iter_mut() {
+            for (i, slot) in st.plugins.iter_mut().enumerate() {
+                if let Some(data) = slot.as_mut().and_then(|s| s.plugin.save_state()) {
+                    out.push((*tid, i, data));
+                }
+            }
+            if let Some(data) = st.instrument.as_mut().and_then(|s| s.plugin.save_state()) {
+                out.push((*tid, INSTRUMENT_SLOT, data));
+            }
+        }
+        out.sort_by_key(|(t, s, _)| (*t, *s));
+        out
     }
 
     pub fn max_block(&self) -> usize {
@@ -262,42 +458,64 @@ impl MixEngine {
     /// Bring plugin instances in line with the session (creates/destroys as needed). Allocates;
     /// call outside the realtime thread when the document changes, or let `render` do it.
     pub fn sync(&mut self, s: &Session) {
-        let sr = self.sample_rate;
         let mb = self.max_block;
         let main_ch = main_channels(s);
         self.main_fmt = s.main_format();
         if self.main.len() != main_ch {
             self.main = vec![vec![0.0; mb]; main_ch];
         }
-        self.strips.retain(|id, _| s.track(*id).is_some());
+        let mut cx = SlotCtx { sr: self.sample_rate, mb, external: self.external, adopt: &mut self.adopt, retired: &mut self.retired };
+        let gone: Vec<TrackId> = self.strips.keys().filter(|id| s.track(**id).is_none()).copied().collect();
+        for id in gone {
+            if let Some(mut st) = self.strips.remove(&id) {
+                for p in st.plugins.drain(..) {
+                    cx.retire(p);
+                }
+                cx.retire(st.instrument.take());
+            }
+        }
         for t in &s.tracks {
             let ch = strip_channels(t, main_ch);
             let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
             }
+            while strip.plugins.len() > t.mixer.inserts.len() {
+                let p = strip.plugins.pop().flatten();
+                cx.retire(p);
+            }
             strip.plugins.resize_with(t.mixer.inserts.len(), || None);
-            for (slot, ins) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()) {
+            for (idx, (slot, ins)) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()).enumerate() {
                 match ins {
                     Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch) => {
-                        *slot = create_plugin(&i.plugin).map(|mut p| {
-                            p.prepare(sr, mb, ch);
-                            PluginSlot { id: i.plugin.clone(), ch, plugin: p, applied: Vec::new() }
-                        });
+                        let old = slot.take();
+                        cx.retire(old);
+                        *slot = cx.make(t.id, idx, i, ch);
                     }
-                    None => *slot = None,
+                    None => {
+                        let old = slot.take();
+                        cx.retire(old);
+                    }
                     _ => {}
                 }
             }
-            let want = t.instrument.as_ref().map(|i| i.plugin.as_str());
-            if strip.instrument.as_ref().map(|p| p.id.as_str()) != want {
-                strip.instrument = want.and_then(|id| {
-                    create_plugin(id).map(|mut p| {
-                        p.prepare(sr, mb, ch.max(2));
-                        PluginSlot { id: id.to_string(), ch: ch.max(2), plugin: p, applied: Vec::new() }
-                    })
-                });
+            let want = t.instrument.as_ref();
+            let ich = ch.max(2);
+            if strip.instrument.as_ref().map(|p| (p.id.as_str(), p.ch)) != want.map(|i| (i.plugin.as_str(), ich)) {
+                let old = strip.instrument.take();
+                cx.retire(old);
+                strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
             }
+        }
+        // Instances nobody claimed (the session changed again before they arrived).
+        let leftovers: Vec<(TrackId, usize)> = cx.adopt.keys().copied().collect();
+        for k in leftovers {
+            if let Some(p) = cx.adopt.remove(&k) {
+                cx.retired.push(p.plugin);
+            }
+        }
+        if !self.external {
+            self.retired.clear();
         }
         for b in &s.busses {
             let n = b.format.channels().clamp(1, MAX_CHANNELS);
@@ -308,6 +526,18 @@ impl MixEngine {
             }
         }
         self.busses.retain(|id, _| s.bus(*id).is_some());
+    }
+
+    /// Re-syncs plugin instances and the routing order when the session's structure changed
+    /// since the last sync (or instances were adopted). `render` calls it; a realtime host may
+    /// also call it right after swapping sessions so slots are filled before playback starts.
+    pub fn ensure_synced(&mut self, s: &Session) {
+        let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
+        if key != self.synced {
+            self.sync(s);
+            self.order = processing_order(s);
+            self.synced = key;
+        }
     }
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
@@ -323,13 +553,7 @@ impl MixEngine {
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
-        // Re-sync plugin instances and routing order only when the session snapshot changes.
-        let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
-        if key != self.synced {
-            self.sync(s);
-            self.order = processing_order(s);
-            self.synced = key;
-        }
+        self.ensure_synced(s);
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -870,21 +1094,21 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
-            let rel0 = pos + i as i64 - clip.start;
-            let rel1 = pos + seg_end as i64 - clip.start;
+            let rel0 = pos.saturating_add(i as i64).saturating_sub(clip.start);
+            let rel1 = pos.saturating_add(seg_end as i64).saturating_sub(clip.start);
             let g0 = clip.gain_at(rel0);
             let g1 = clip.gain_at(rel1.min(clip.length));
             let n = (seg_end - i) as f32;
             for k in i..seg_end {
-                let rel = pos + k as i64 - clip.start;
+                let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset + rel).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
                     let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get(x0 as usize + 1).copied().unwrap_or(0.0) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -927,9 +1151,9 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             n.velocity = (i64::from(n.velocity) + dv).clamp(1, 127) as u8;
             n.pitch = (i64::from(n.pitch) + dp).clamp(0, 127) as u8;
             n.length = ((n.length as f64 * dur) as i64).max(1);
-            n.start = (n.start + delay).max(0);
-            let on = s.tempo.tick_to_samples(base + n.start, sr);
-            let off = s.tempo.tick_to_samples(base + n.start + n.length, sr).min(clip.end());
+            n.start = n.start.saturating_add(delay).max(0);
+            let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
+            let off = s.tempo.tick_to_samples(base.saturating_add(n.start).saturating_add(n.length), sr).min(clip.end());
             if on >= clip.end() {
                 continue;
             }
@@ -1412,7 +1636,10 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
 fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
-    soundcraft_dsp::create(id).or_else(|| soundcraft_clap_host::create(id)).or_else(|| soundcraft_vst3_host::create(id))
+    soundcraft_dsp::create(id)
+        .or_else(|| soundcraft_clap_host::create(id))
+        .or_else(|| soundcraft_vst3_host::create(id))
+        .or_else(|| soundcraft_au_host::create(id))
 }
 
 #[cfg(test)]
@@ -1526,6 +1753,113 @@ mod tests {
         ins.params.insert("gain".into(), -6.0);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
         let _ = render_range(&s, Range::new(0, 4800), 512);
+    }
+
+    /// A built-in gain behind a third-party id, with a state blob and a log of parameter sets.
+    struct Stateful {
+        inner: Box<dyn Plugin>,
+        blob: Vec<u8>,
+        sets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Plugin for Stateful {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.sets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn save_state(&mut self) -> Option<Vec<u8>> {
+            Some(self.blob.clone())
+        }
+    }
+
+    fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        eng.render(s, pos, 512, &mut out);
+        out[0][500]
+    }
+
+    #[test]
+    fn external_instances_are_adopted_retired_and_captured() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let mut ins = Insert::new("clap:test.fake");
+        ins.params.insert("gain".into(), -6.0);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+        let specs = instance_specs(&s);
+        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None }]);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        // Nothing to adopt yet: the slot passes audio through (and sync never tried to load a
+        // CLAP plugin on this thread).
+        let dry = render_block(&mut eng, &s, 0);
+        assert!(dry > 0.3, "{dry}");
+        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut gain = soundcraft_dsp::create("gain").unwrap();
+        gain.prepare(48_000.0, 512, 1);
+        let fake = Stateful { inner: gain, blob: b"live state".to_vec(), sets: Arc::clone(&sets) };
+        // An instance for the wrong channel count is retired, not used.
+        let wrong = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 2, plugin: Box::new(wrong) }]);
+        assert!(render_block(&mut eng, &s, 512) > 0.3);
+        assert_eq!(eng.take_retired().len(), 1);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: Box::new(fake) }]);
+        let mut wet = 0.0;
+        for b in 2..20 {
+            wet = render_block(&mut eng, &s, b * 512);
+        }
+        assert!((wet / dry - 0.501).abs() < 0.01, "{wet} vs {dry}");
+        assert!(sets.load(std::sync::atomic::Ordering::Relaxed) > 0, "no stored state: session params are pushed");
+        assert_eq!(eng.capture_states(), vec![(t, 0, b"live state".to_vec())]);
+        assert!(eng.take_retired().is_empty());
+        // Removing the insert retires the instance instead of dropping it here.
+        s.track_mut(t).unwrap().mixer.inserts[0] = None;
+        render_block(&mut eng, &s, 20 * 512);
+        assert_eq!(eng.take_retired().len(), 1);
+        assert!(eng.capture_states().is_empty());
+        // Instances nobody claims are retired too; drain_plugins empties the engine.
+        eng.adopt(vec![PreparedInstance { track: t, slot: 3, id: "clap:x".into(), ch: 1, plugin: soundcraft_dsp::create("gain").unwrap() }]);
+        render_block(&mut eng, &s, 21 * 512);
+        assert_eq!(eng.take_retired().len(), 1);
+        assert!(eng.drain_plugins().is_empty());
+    }
+
+    #[test]
+    fn stored_state_comes_first_then_session_params() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let mut ins = Insert::new("vst3:00000000000000000000000000000001");
+        ins.params.insert("gain".into(), -6.0);
+        ins.set_state_bytes(b"stored");
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+        assert_eq!(instance_specs(&s)[0].state.as_deref(), Some(&b"stored"[..]));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "vst3:00000000000000000000000000000001".into(), ch: 1, plugin: Box::new(fake) }]);
+        render_block(&mut eng, &s, 0);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1, "session params apply once");
+        render_block(&mut eng, &s, 512);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1);
+        s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("gain".into(), -12.0);
+        render_block(&mut eng, &s, 1024);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 2, "later session edits apply");
+        // Offline (not external): unknown third-party plugins are simply absent.
+        let out = render_range(&s, Range::new(0, 1024), 512);
+        assert!(out[0][100] > 0.3);
     }
 
     #[test]

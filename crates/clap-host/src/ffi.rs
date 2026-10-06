@@ -18,17 +18,20 @@ use clap_sys::events::{
     clap_event_note, clap_event_param_value, clap_input_events, clap_output_events,
 };
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
+use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui, clap_plugin_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, CLAP_LOG_FATAL, CLAP_LOG_WARNING, clap_host_log, clap_log_severity};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_note_port_info, clap_plugin_note_ports};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags, clap_param_info, clap_param_rescan_flags, clap_plugin_params,
 };
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::id::clap_id;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -48,6 +51,10 @@ pub(crate) const MAX_PORT_CHANNELS: u32 = 64;
 const MAX_FEATURES: usize = 64;
 /// Capacity of the per-block event list (preallocated: `process` never allocates).
 pub(crate) const EVENT_CAP: usize = 1024;
+/// Largest plugin state we accept from `clap_plugin_state.save` (hostile-input cap).
+pub(crate) const MAX_STATE_BYTES: usize = 64 << 20;
+/// Most editor parameter edits buffered between two UI frames.
+const EDIT_CAP: usize = 256;
 
 // ---- plugin strings ------------------------------------------------------------------------
 
@@ -212,10 +219,10 @@ impl Bundle {
         let err = |m: &str| ClapError::Instantiate(plugin_id.to_string(), m.to_string());
         let create = self.factory().create_plugin.ok_or_else(|| err("factory cannot create plugins"))?;
         let cid = CString::new(plugin_id).map_err(|_| err("id contains NUL"))?;
-        let state = Box::new(HostState::default());
+        let state = Arc::new(HostState::default());
         let host = Box::new(clap_host {
             clap_version: CLAP_VERSION,
-            host_data: (&*state as *const HostState).cast_mut().cast::<c_void>(),
+            host_data: Arc::as_ptr(&state).cast_mut().cast::<c_void>(),
             name: c"SoundCraft".as_ptr(),
             vendor: c"SoundCraft contributors".as_ptr(),
             url: c"https://github.com/storytold/soundcraft".as_ptr(),
@@ -237,7 +244,10 @@ impl Bundle {
             ports: std::ptr::null(),
             latency: std::ptr::null(),
             notes: std::ptr::null(),
+            state_ext: std::ptr::null(),
+            gui: Arc::new(GuiLink::default()),
             raw: Vec::with_capacity(EVENT_CAP),
+            out_params: Vec::with_capacity(EVENT_CAP),
             active: false,
             processing: false,
             max_frames: 0,
@@ -261,6 +271,12 @@ impl Bundle {
         inst.ports = inst.extension::<clap_plugin_audio_ports>(CLAP_EXT_AUDIO_PORTS);
         inst.latency = inst.extension::<clap_plugin_latency>(CLAP_EXT_LATENCY);
         inst.notes = inst.extension::<clap_plugin_note_ports>(CLAP_EXT_NOTE_PORTS);
+        inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
+        let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
+        inst.gui = Arc::new(GuiLink {
+            inner: Mutex::new(GuiInner { plugin, gui, alive: !gui.is_null(), created: false, visible: false }),
+            host: Arc::clone(&inst.state),
+        });
         Ok(inst)
     }
 }
@@ -280,13 +296,40 @@ impl Drop for Bundle {
 // ---- host side -----------------------------------------------------------------------------
 
 /// Flags the plugin raises through the host callbacks (any thread).
-#[derive(Default)]
 pub(crate) struct HostState {
     pub restart: AtomicBool,
     pub process: AtomicBool,
     pub callback: AtomicBool,
     pub latency_changed: AtomicBool,
     pub params_rescan: AtomicBool,
+    /// `clap_host_state.mark_dirty`.
+    pub dirty: AtomicBool,
+    /// `clap_host_gui` requests, serviced by the editor's `idle` on the main thread.
+    pub gui_closed: AtomicBool,
+    pub gui_destroyed: AtomicBool,
+    pub gui_show: AtomicBool,
+    pub gui_hide: AtomicBool,
+    /// Parameter changes the plugin reported (output events: typically edits in its GUI),
+    /// waiting for the UI. Bounded by `EDIT_CAP`; the audio thread only `try_lock`s it.
+    pub edits: Mutex<Vec<(u32, f64)>>,
+}
+
+impl Default for HostState {
+    fn default() -> Self {
+        HostState {
+            restart: AtomicBool::new(false),
+            process: AtomicBool::new(false),
+            callback: AtomicBool::new(false),
+            latency_changed: AtomicBool::new(false),
+            params_rescan: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            gui_closed: AtomicBool::new(false),
+            gui_destroyed: AtomicBool::new(false),
+            gui_show: AtomicBool::new(false),
+            gui_hide: AtomicBool::new(false),
+            edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+        }
+    }
 }
 
 /// SAFETY contract: `host` is null or one of our `clap_host` structs, whose `host_data` points
@@ -355,6 +398,60 @@ unsafe extern "C" fn host_latency_changed(host: *const clap_host) {
     }
 }
 
+unsafe extern "C" fn host_state_mark_dirty(host: *const clap_host) {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    if let Some(s) = unsafe { state(host) } {
+        s.dirty.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn host_gui_resize_hints_changed(_host: *const clap_host) {}
+
+unsafe extern "C" fn host_gui_request_resize(_host: *const clap_host, _width: u32, _height: u32) -> bool {
+    // Floating windows belong to the plugin, which resizes them itself.
+    true
+}
+
+unsafe extern "C" fn host_gui_request_show(host: *const clap_host) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    match unsafe { state(host) } {
+        Some(s) => {
+            s.gui_show.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe extern "C" fn host_gui_request_hide(host: *const clap_host) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    match unsafe { state(host) } {
+        Some(s) => {
+            s.gui_hide.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe extern "C" fn host_gui_closed(host: *const clap_host, was_destroyed: bool) {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    if let Some(s) = unsafe { state(host) } {
+        if was_destroyed {
+            s.gui_destroyed.store(true, Ordering::Relaxed);
+        }
+        s.gui_closed.store(true, Ordering::Relaxed);
+    }
+}
+
+static HOST_STATE: clap_host_state = clap_host_state { mark_dirty: Some(host_state_mark_dirty) };
+static HOST_GUI: clap_host_gui = clap_host_gui {
+    resize_hints_changed: Some(host_gui_resize_hints_changed),
+    request_resize: Some(host_gui_request_resize),
+    request_show: Some(host_gui_request_show),
+    request_hide: Some(host_gui_request_hide),
+    closed: Some(host_gui_closed),
+};
 static HOST_LOG: clap_host_log = clap_host_log { log: Some(host_log) };
 static HOST_PARAMS: clap_host_params =
     clap_host_params { rescan: Some(host_params_rescan), clear: Some(host_params_clear), request_flush: Some(host_params_request_flush) };
@@ -372,8 +469,12 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
         (&HOST_PARAMS as *const clap_host_params).cast()
     } else if id == CLAP_EXT_LATENCY {
         (&HOST_LATENCY as *const clap_host_latency).cast()
+    } else if id == CLAP_EXT_STATE {
+        (&HOST_STATE as *const clap_host_state).cast()
+    } else if id == CLAP_EXT_GUI {
+        (&HOST_GUI as *const clap_host_gui).cast()
     } else {
-        // Everything else (gui, state, thread-check, timers, …) is unsupported: CLAP allows null.
+        // Everything else (thread-check, timers, fd support, …) is unsupported: CLAP allows null.
         std::ptr::null()
     }
 }
@@ -495,10 +596,285 @@ unsafe extern "C" fn in_events_get(list: *const clap_input_events, index: u32) -
     v.and_then(|v| v.get(index as usize)).map_or(std::ptr::null(), RawEvent::header)
 }
 
-unsafe extern "C" fn out_events_try_push(_list: *const clap_output_events, _event: *const clap_event_header) -> bool {
-    // Plugin → host events (e.g. GUI parameter edits) are accepted and ignored: SoundCraft's
-    // session is the source of truth for parameter values.
+unsafe extern "C" fn out_events_try_push(list: *const clap_output_events, event: *const clap_event_header) -> bool {
+    // Plugin → host events are accepted. Parameter values (typically edits in the plugin's GUI)
+    // are kept, while there is room, so the UI can write them into the session; the rest is
+    // ignored.
+    if list.is_null() || event.is_null() {
+        return true;
+    }
+    // SAFETY: CLAP passes a valid event header for the duration of the call.
+    let h = unsafe { &*event };
+    if h.space_id != CLAP_CORE_EVENT_SPACE_ID || h.type_ != CLAP_EVENT_PARAM_VALUE || (h.size as usize) < size_of::<clap_event_param_value>() {
+        return true;
+    }
+    // SAFETY: the header says this is a complete `clap_event_param_value` (type and size checked).
+    let e = unsafe { &*event.cast::<clap_event_param_value>() };
+    // SAFETY: `ctx` is null or the instance's preallocated `out_params` Vec, which `process`
+    // borrows exclusively for the duration of the plugin call.
+    if let Some(v) = unsafe { ((*list).ctx as *mut Vec<(u32, f64)>).as_mut() }
+        && v.len() < v.capacity()
+        && e.value.is_finite()
+    {
+        v.push((e.param_id, e.value));
+    }
     true
+}
+
+// ---- state streams -------------------------------------------------------------------------
+
+/// Read side of an in-memory state blob.
+struct ReadCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+unsafe extern "C" fn istream_read(stream: *const clap_istream, buffer: *mut c_void, size: u64) -> i64 {
+    if stream.is_null() || buffer.is_null() {
+        return -1;
+    }
+    // SAFETY: `ctx` is the `ReadCursor` on `load_state`'s stack frame, alive during the call.
+    let Some(c) = (unsafe { ((*stream).ctx as *mut ReadCursor<'_>).as_mut() }) else { return -1 };
+    let rest = c.data.get(c.pos..).unwrap_or(&[]);
+    let n = rest.len().min(usize::try_from(size).unwrap_or(usize::MAX));
+    if let Some(src) = rest.get(..n) {
+        // SAFETY: the plugin provides `size` ≥ `n` writable bytes at `buffer`; `src` is `n`
+        // readable bytes of our own slice; they cannot overlap.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buffer.cast::<u8>(), n) };
+    }
+    c.pos += n;
+    i64::try_from(n).unwrap_or(-1)
+}
+
+unsafe extern "C" fn ostream_write(stream: *const clap_ostream, buffer: *const c_void, size: u64) -> i64 {
+    if stream.is_null() || buffer.is_null() {
+        return -1;
+    }
+    // SAFETY: `ctx` is the output Vec on `save_state`'s stack frame, alive during the call.
+    let Some(v) = (unsafe { ((*stream).ctx as *mut Vec<u8>).as_mut() }) else { return -1 };
+    let Ok(n) = usize::try_from(size) else { return -1 };
+    if v.len().saturating_add(n) > MAX_STATE_BYTES {
+        return -1;
+    }
+    // SAFETY: the plugin provides `size` readable bytes at `buffer` for the call.
+    let src = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
+    v.extend_from_slice(src);
+    i64::try_from(n).unwrap_or(-1)
+}
+
+// ---- editor (clap.gui) ---------------------------------------------------------------------
+
+/// True on the process's main thread (AppKit requires GUI calls there).
+#[cfg(target_os = "macos")]
+pub(crate) fn on_main_thread() -> bool {
+    unsafe extern "C" {
+        fn pthread_main_np() -> std::ffi::c_int;
+    }
+    // SAFETY: a libSystem function without arguments or preconditions.
+    unsafe { pthread_main_np() == 1 }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_main_thread() -> bool {
+    true
+}
+
+/// The windowing API of this platform.
+fn window_api() -> Option<&'static CStr> {
+    if cfg!(target_os = "macos") {
+        Some(clap_sys::ext::gui::CLAP_WINDOW_API_COCOA)
+    } else if cfg!(windows) {
+        Some(clap_sys::ext::gui::CLAP_WINDOW_API_WIN32)
+    } else if cfg!(all(unix, not(target_os = "android"))) {
+        Some(clap_sys::ext::gui::CLAP_WINDOW_API_X11)
+    } else {
+        None
+    }
+}
+
+struct GuiInner {
+    plugin: *const clap_plugin,
+    gui: *const clap_plugin_gui,
+    /// The plugin instance exists (cleared by `Instance::drop` before it destroys the plugin).
+    alive: bool,
+    created: bool,
+    visible: bool,
+}
+
+/// The link between an instance and its editor handles. The instance may process on the audio
+/// thread while the editor is driven from the main thread: CLAP allows `clap.gui` (main-thread)
+/// calls concurrently with audio-thread calls. Every GUI call happens under this lock, and the
+/// instance clears `alive` (destroying any GUI) under the same lock before it destroys the
+/// plugin, so a handle can never call into a destroyed plugin.
+pub(crate) struct GuiLink {
+    inner: Mutex<GuiInner>,
+    host: Arc<HostState>,
+}
+
+impl Default for GuiLink {
+    fn default() -> Self {
+        GuiLink {
+            inner: Mutex::new(GuiInner { plugin: std::ptr::null(), gui: std::ptr::null(), alive: false, created: false, visible: false }),
+            host: Arc::new(HostState::default()),
+        }
+    }
+}
+
+// SAFETY: the raw pointers are only dereferenced under the mutex, while `alive` guarantees the
+// plugin exists; CLAP's threading rules (main-thread GUI calls) are checked at each call.
+unsafe impl Send for GuiInner {}
+
+impl GuiLink {
+    fn lock(&self) -> std::sync::MutexGuard<'_, GuiInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn available(&self) -> bool {
+        self.lock().alive
+    }
+
+    pub fn host(&self) -> &HostState {
+        &self.host
+    }
+
+    fn vt(g: &GuiInner) -> Option<clap_plugin_gui> {
+        // SAFETY: `gui` is null or the plugin's static extension vtable, valid while `alive`.
+        (g.alive).then(|| unsafe { g.gui.as_ref() }.copied()).flatten()
+    }
+
+    /// Opens (creates and shows) the plugin's floating editor window.
+    pub fn open(&self, title: &str) -> Result<(), String> {
+        if !on_main_thread() {
+            return Err("plugin editors must be opened on the main thread".into());
+        }
+        let mut g = self.lock();
+        let vt = GuiLink::vt(&g).ok_or_else(|| "this plugin has no editor".to_string())?;
+        if g.created {
+            if let Some(show) = vt.show {
+                // SAFETY: live plugin with a created GUI; main thread (checked).
+                unsafe { show(g.plugin) };
+            }
+            g.visible = true;
+            return Ok(());
+        }
+        let api = window_api().ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
+        let (Some(supported), Some(create)) = (vt.is_api_supported, vt.create) else { return Err("incomplete clap.gui extension".into()) };
+        // SAFETY: live plugin; `api` is a static NUL-terminated string; main thread.
+        if !unsafe { supported(g.plugin, api.as_ptr(), true) } {
+            return Err("this plugin offers only an embedded editor; SoundCraft hosts floating CLAP editors".into());
+        }
+        self.host.gui_closed.store(false, Ordering::Relaxed);
+        self.host.gui_destroyed.store(false, Ordering::Relaxed);
+        // SAFETY: as above; no GUI exists yet.
+        if !unsafe { create(g.plugin, api.as_ptr(), true) } {
+            return Err("the plugin could not create its editor".into());
+        }
+        g.created = true;
+        if !cfg!(target_os = "macos")
+            && let Some(f) = vt.set_scale
+        {
+            // SAFETY: live plugin with a created GUI. (Cocoa uses logical pixels: not called.)
+            unsafe { f(g.plugin, 1.0) };
+        }
+        if let (Some(f), Ok(t)) = (vt.suggest_title, CString::new(title)) {
+            // SAFETY: live plugin with a created floating GUI; `t` outlives the call.
+            unsafe { f(g.plugin, t.as_ptr()) };
+        }
+        let shown = match vt.show {
+            // SAFETY: as above.
+            Some(f) => unsafe { f(g.plugin) },
+            None => false,
+        };
+        if !shown {
+            GuiLink::destroy(&mut g);
+            return Err("the plugin could not show its editor".into());
+        }
+        g.visible = true;
+        Ok(())
+    }
+
+    fn destroy(g: &mut GuiInner) {
+        if g.created
+            && let Some(f) = GuiLink::vt(g).and_then(|v| v.destroy)
+        {
+            // SAFETY: live plugin with a created GUI; destroyed exactly once.
+            unsafe { f(g.plugin) };
+        }
+        g.created = false;
+        g.visible = false;
+    }
+
+    /// Closes (destroys) the editor.
+    pub fn close(&self) {
+        if !on_main_thread() {
+            return;
+        }
+        GuiLink::destroy(&mut self.lock());
+    }
+
+    pub fn is_open(&self) -> bool {
+        let g = self.lock();
+        g.alive && g.created && g.visible
+    }
+
+    /// Main-thread housekeeping: runs a requested `on_main_thread`, follows the plugin's
+    /// show/hide/closed requests, and returns the parameter edits reported since the last call.
+    pub fn idle(&self) -> Vec<(u32, f64)> {
+        if !on_main_thread() {
+            return Vec::new();
+        }
+        let mut g = self.lock();
+        if !g.alive {
+            return Vec::new();
+        }
+        if self.host.callback.swap(false, Ordering::Relaxed) {
+            // SAFETY: `plugin` is valid while `alive`; we copy its vtable struct.
+            if let Some(f) = unsafe { (*g.plugin).on_main_thread } {
+                // SAFETY: live plugin, main thread, requested via `request_callback`.
+                unsafe { f(g.plugin) };
+            }
+        }
+        if g.created {
+            if self.host.gui_closed.swap(false, Ordering::Relaxed) {
+                // The user closed the floating window (or the plugin lost its GUI): free it.
+                self.host.gui_destroyed.store(false, Ordering::Relaxed);
+                GuiLink::destroy(&mut g);
+            } else if let Some(vt) = GuiLink::vt(&g) {
+                if self.host.gui_show.swap(false, Ordering::Relaxed)
+                    && let Some(f) = vt.show
+                {
+                    // SAFETY: live plugin with a created GUI, main thread.
+                    g.visible = unsafe { f(g.plugin) };
+                }
+                if self.host.gui_hide.swap(false, Ordering::Relaxed)
+                    && let Some(f) = vt.hide
+                {
+                    // SAFETY: as above.
+                    unsafe { f(g.plugin) };
+                    g.visible = false;
+                }
+            }
+        }
+        drop(g);
+        let mut e = self.host.edits.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = e.clone();
+        e.clear();
+        out
+    }
+
+    /// Called by the instance before it destroys the plugin.
+    fn kill(&self) {
+        let mut g = self.lock();
+        if g.created {
+            if on_main_thread() {
+                GuiLink::destroy(&mut g);
+            } else {
+                log::warn!("clap: editor still open while its plugin is destroyed off the main thread");
+                g.created = false;
+            }
+        }
+        g.alive = false;
+    }
 }
 
 // ---- audio buffers -------------------------------------------------------------------------
@@ -590,7 +966,11 @@ pub(crate) struct Instance {
     ports: *const clap_plugin_audio_ports,
     latency: *const clap_plugin_latency,
     notes: *const clap_plugin_note_ports,
+    state_ext: *const clap_plugin_state,
+    gui: Arc<GuiLink>,
     raw: Vec<RawEvent>,
+    /// Parameter values the plugin reported through output events in the current `process`.
+    out_params: Vec<(u32, f64)>,
     active: bool,
     processing: bool,
     max_frames: usize,
@@ -598,7 +978,7 @@ pub(crate) struct Instance {
     // Field order matters for drop: the plugin is destroyed in `Drop::drop` first; then the host
     // struct and its state, then the bundle (which keeps the code mapped) go.
     _host: Box<clap_host>,
-    state: Box<HostState>,
+    state: Arc<HostState>,
     _bundle: Arc<Bundle>,
 }
 
@@ -624,6 +1004,31 @@ impl Instance {
 
     pub fn state(&self) -> &HostState {
         &self.state
+    }
+
+    /// The editor link shared with editor handles (`None` when the plugin has no `clap.gui`).
+    pub fn gui(&self) -> Option<Arc<GuiLink>> {
+        self.gui.available().then(|| Arc::clone(&self.gui))
+    }
+
+    /// `clap_plugin_state.save` into memory (`None` without the extension or on failure).
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        // SAFETY: the extension pointer, when non-null, points to a static vtable in the plugin.
+        let save = unsafe { self.state_ext.as_ref() }?.save?;
+        let mut out: Vec<u8> = Vec::new();
+        let stream = clap_ostream { ctx: (&mut out as *mut Vec<u8>).cast::<c_void>(), write: Some(ostream_write) };
+        // SAFETY: valid instance; the stream and its context live on this frame for the call.
+        unsafe { save(self.plugin, &stream) }.then_some(out)
+    }
+
+    /// `clap_plugin_state.load` from memory. `false` without the extension or when refused.
+    pub fn load_state(&self, data: &[u8]) -> bool {
+        // SAFETY: see `save_state`.
+        let Some(load) = (unsafe { self.state_ext.as_ref() }).and_then(|s| s.load) else { return false };
+        let mut cursor = ReadCursor { data, pos: 0 };
+        let stream = clap_istream { ctx: (&mut cursor as *mut ReadCursor<'_>).cast::<c_void>(), read: Some(istream_read) };
+        // SAFETY: valid instance; the stream and its cursor live on this frame for the call.
+        unsafe { load(self.plugin, &stream) }
     }
 
     /// Runs `on_main_thread` if the plugin asked for a callback.
@@ -810,7 +1215,9 @@ impl Instance {
             size: Some(in_events_size),
             get: Some(in_events_get),
         };
-        let out_events = clap_output_events { ctx: std::ptr::null_mut(), try_push: Some(out_events_try_push) };
+        self.out_params.clear();
+        let out_events =
+            clap_output_events { ctx: (&mut self.out_params as *mut Vec<(u32, f64)>).cast::<c_void>(), try_push: Some(out_events_try_push) };
         let p = clap_process {
             steady_time,
             frames_count: u32::try_from(frames).unwrap_or(0),
@@ -827,12 +1234,25 @@ impl Instance {
         // lists and their contexts live on this stack frame / in `self.raw`, untouched until the
         // call returns.
         let status = unsafe { process(self.plugin, &p) };
+        if !self.out_params.is_empty()
+            && let Ok(mut edits) = self.state.edits.try_lock()
+        {
+            // Never blocks or grows: a busy UI or a full queue drops the edits.
+            for &e in &self.out_params {
+                if edits.len() < edits.capacity() {
+                    edits.push(e);
+                }
+            }
+        }
+        self.out_params.clear();
         if status == CLAP_PROCESS_ERROR { Err(ClapError::Process("plugin reported a processing error".into())) } else { Ok(status) }
     }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // Editors first (CLAP: destroy the GUI before the plugin), and no handle may call in after.
+        self.gui.kill();
         self.deactivate();
         if self.created
             && let Some(f) = self.vt().destroy
