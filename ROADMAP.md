@@ -9,8 +9,8 @@ the honest status: what works today, what is missing, and how far we are.
 | Measure | Value | How |
 |---|---|---|
 | Menu-catalog parity (engine + UI) | **462 / 512 menu items (90 %)**; engine alone 388 / 512 (76 %), see [`docs/parity.md`](docs/parity.md) | `cargo xtask parity` compares the incumbent's 512 menu leaves (names observed black-box) with our command registry; the remaining items are mostly video, Atmos, collaboration, notation and third-party services |
-| Estimated overall feature parity | **~50 %** | judgement across the areas below, weighted by how much professional users rely on them |
-| Estimated remaining effort | **~170–230 wall-clock hours** of Claude Opus 5.5 work (single agent; roughly 55–80 hours with 3–4 agents in parallel) | sum of the per-area estimates below |
+| Estimated overall feature parity | **~55 %** | judgement across the areas below, weighted by how much professional users rely on them |
+| Estimated remaining effort | **~150–200 wall-clock hours** of Claude Opus 5.5 work (single agent; roughly 50–70 hours with 3–4 agents in parallel) | sum of the per-area estimates below |
 
 ### Area by area
 
@@ -22,14 +22,21 @@ the honest status: what works today, what is missing, and how far we are.
 | Mixer & routing | Faders, pan, mute/solo (SIP, implicit solo), sends pre/post, busses, aux inputs, master faders, VCAs, routing folders, 10 inserts, plugin delay compensation, clip effects | 70 % | 20 |
 | Automation | Breakpoint lanes for volume/pan/mute/sends/plugin params, trim automation; live Write/Touch/Latch passes; write/thin/glide/convert/coalesce commands | 60 % | 18 |
 | Plugins (built-in) | 26 original processors + 2 instruments, AudioSuite offline processing | 45 % | 30 |
-| Third-party plugins (CLAP/VST3/AU) | CLAP hosting (audio, params, latency, notes) in an isolated unsafe crate; no plugin GUIs, no state save, no VST3/AU | 30 % | 30 |
+| Third-party plugins (CLAP/VST3/AU) | CLAP hosting (audio, params, latency, notes); VST3 hosting in progress; no plugin GUIs, no state save, no AU | 35 % | 28 |
 | MIDI | MIDI/instrument tracks, SMF import/export, MIDI editor (piano roll + velocity), event list, step input, quantize/transpose/velocity/duration ops | 40 % | 30 |
 | Recording | Input capture, punch in/out (selection, on the fly, pre/post-roll), loop record into playlists, input monitoring through the channel strip, autosave and recovery | 60 % | 12 |
 | Elastic Audio / TCE / Beat Detective | Pitch-preserving warp on Elastic tracks, TCE to timeline, conform to tempo, Beat Detective and Identify Beat windows | 40 % | 18 |
-| Video, surround panning, Atmos | Formats modelled; no video track, no surround panner | 5 % | 40 |
+| Surround | Main and bus formats from stereo to 9.1.6 and Ambisonics, surround panner with divergence/centre/LFE/height, ITU fold-down, multichannel bounce, meters and device output | 60 % | 15 |
+| Video | Movie audio import; no picture track yet | 10 % | 35 |
 | UI fidelity | Edit + Mix windows, toolbar, rulers, track headers, menus for the whole catalog, floating windows, dialogs | 65 % | 25 |
 | Agent control | CLI, JSON control channel, MCP server (headless + bridged), offscreen UI renders | 90 % (ahead of the incumbent) | 5 |
 | Release engineering | Signed macOS universal, Windows x64/x86, Linux AppImage/deb/rpm/tar/Flatpak, FreeBSD, Web/WASM on every push to `release` | 80 % | 5 |
+
+## Robustness
+
+Property tests drive random edit sequences (with full undo), mutated session files and hostile
+command parameters through the engine and mixer; they have already caught fade, overflow and
+unbounded-allocation bugs. Every command also runs with empty parameters on empty and demo sessions.
 
 ## Current focus
 

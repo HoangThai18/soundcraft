@@ -44,12 +44,12 @@ fn track_json(e: &Engine, t: &Track, full: bool) -> Value {
         .iter()
         .enumerate()
         .filter_map(|(i, x)| {
-            x.as_ref().map(|x| json!({"slot": i, "target": x.target, "level_db": x.level_db, "pan": x.pan, "mute": x.mute, "pre_fader": x.pre_fader}))
+            x.as_ref().map(|x| json!({"slot": i, "target": x.target, "level_db": x.level_db, "pan": x.pan, "mute": x.mute, "pre_fader": x.pre_fader, "surround": x.surround}))
         })
         .collect();
     let mut v = json!({
         "id": t.id, "name": t.name, "kind": t.kind.id(), "format": t.format.label(),
-        "volume_db": t.mixer.volume_db, "pan": t.mixer.pan, "mute": t.mixer.mute, "solo": t.mixer.solo,
+        "volume_db": t.mixer.volume_db, "pan": t.mixer.pan, "surround": t.mixer.surround, "mute": t.mixer.mute, "solo": t.mixer.solo,
         "record_arm": t.mixer.record_arm, "input": t.mixer.input, "output": t.mixer.output,
         "automation_mode": t.mixer.automation_mode.label(), "inserts": inserts, "sends": sends,
         "clips": t.clips().iter().map(|c| clip_json(e, c)).collect::<Vec<_>>(),
@@ -70,7 +70,7 @@ pub fn session(e: &Engine, full: bool) -> Value {
     let s = e.session();
     json!({
         "name": s.name, "path": e.path, "dirty": e.is_dirty(), "sample_rate": s.sample_rate.hz(), "bit_depth": s.bit_depth,
-        "frame_rate": s.frame_rate.label(), "tempo": s.tempo.tempos(), "meter": s.tempo.meters(),
+        "frame_rate": s.frame_rate.label(), "tempo": s.tempo.tempos(), "meter": s.tempo.meters(), "main_format": s.main_format().label(),
         "length_samples": s.content_end(),
         "tracks": s.tracks.iter().map(|t| track_json(e, t, full)).collect::<Vec<_>>(),
         "busses": s.busses.iter().map(|b| json!({"id": b.id, "name": b.name, "format": b.format.label()})).collect::<Vec<_>>(),

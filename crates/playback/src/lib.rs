@@ -6,11 +6,16 @@
 //! the callback through a channel; position and meters come back through atomics and a
 //! `try_lock`ed snapshot, so the callback never blocks. When no device is available the player
 //! falls back to a silent clock thread so the transport, meters and automation still run.
+//!
+//! Surround: the device is opened with as many output channels as it offers, up to the width of
+//! the session's main format. Main channels (SMPTE/WAV order) go to device channels in order; when
+//! the device has fewer channels than the main mix, the mix is folded down to stereo (ITU-R
+//! BS.775) on the first two device channels.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod record;
 
-use soundcraft_mix::{MixEngine, StripMeter};
+use soundcraft_mix::{MAX_CHANNELS, MixEngine, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
@@ -55,8 +60,10 @@ struct AudioState {
     end: Option<Samples>,
     looped: Option<Range>,
     block: Vec<Vec<f32>>,
-    /// Rendered frames waiting to be consumed (stereo planar) and the fractional read index.
+    /// Rendered frames waiting to be consumed (planar, main channels) and the fractional read index.
     pending: Vec<Vec<f32>>,
+    /// Stereo fold-down gains per main channel (used when the device has fewer channels).
+    fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
     read: f64,
     device_rate: f64,
@@ -67,7 +74,9 @@ struct AudioState {
 impl AudioState {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
+        let nch = main_channels(&session);
         AudioState {
+            fold: fold_gains(&session),
             rx,
             shared,
             mix: MixEngine::new(sr, BLOCK),
@@ -76,8 +85,8 @@ impl AudioState {
             playing: false,
             end: None,
             looped: None,
-            block: vec![vec![0.0; BLOCK]; 2],
-            pending: vec![vec![0.0; BLOCK]; 2],
+            block: vec![vec![0.0; BLOCK]; nch],
+            pending: vec![vec![0.0; BLOCK]; nch],
             pending_len: 0,
             read: 0.0,
             device_rate,
@@ -95,6 +104,15 @@ impl AudioState {
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         self.mix = MixEngine::new(s.sample_rate.as_f64() as f32, BLOCK);
                     }
+                    // The main format changed (a document edit, not steady state): resize.
+                    let nch = main_channels(&s);
+                    if self.block.len() != nch {
+                        self.block = vec![vec![0.0; BLOCK]; nch];
+                        self.pending = vec![vec![0.0; BLOCK]; nch];
+                        self.pending_len = 0;
+                        self.read = 0.0;
+                    }
+                    self.fold = fold_gains(&s);
                     self.session = s;
                 }
                 Cmd::Play { from, end, looped } => {
@@ -168,9 +186,14 @@ impl AudioState {
         self.pos += n as i64;
         self.shared.position.store(self.pos, Ordering::Relaxed);
         if let Ok(mut m) = self.shared.meters.try_lock() {
-            m.main = self.mix.main_meter;
+            m.main.copy_from(&self.mix.main_meter);
             for (k, v) in &self.mix.meters {
-                m.tracks.insert(*k, *v);
+                match m.tracks.get_mut(k) {
+                    Some(d) => d.copy_from(v),
+                    None => {
+                        m.tracks.insert(*k, v.clone());
+                    }
+                }
             }
         }
     }
@@ -203,11 +226,36 @@ impl AudioState {
             }
             let i0 = self.read.floor() as usize;
             let fr = (self.read - i0 as f64) as f32;
-            for (c, o) in frame.iter_mut().enumerate() {
-                let ch = self.pending.get(c.min(1));
+            let sounding = self.playing || monitoring;
+            let nch = self.pending.len();
+            let sample = |c: usize| {
+                let ch = self.pending.get(c);
                 let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
                 let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
-                *o = if c < 2 && (self.playing || monitoring) { (a + (b - a) * fr).clamp(-1.0, 1.0) } else { 0.0 };
+                a + (b - a) * fr
+            };
+            if nch > 2 && channels < nch {
+                // Fewer device channels than the main mix: ITU fold-down to stereo.
+                let (mut l, mut r) = (0.0f32, 0.0f32);
+                if sounding {
+                    for (c, (gl, gr)) in self.fold.iter().enumerate().take(nch) {
+                        let v = sample(c);
+                        l += v * gl;
+                        r += v * gr;
+                    }
+                }
+                for (c, o) in frame.iter_mut().enumerate() {
+                    *o = match c {
+                        0 => l.clamp(-1.0, 1.0),
+                        1 => r.clamp(-1.0, 1.0),
+                        _ => 0.0,
+                    };
+                }
+            } else {
+                for (c, o) in frame.iter_mut().enumerate() {
+                    // Stereo mixes on a mono device play the left channel (as before).
+                    *o = if c < nch.max(1) && sounding { sample(c).clamp(-1.0, 1.0) } else { 0.0 };
+                }
             }
             self.read += step;
         }
@@ -224,6 +272,8 @@ pub struct Player {
     _stream: Option<cpal::Stream>,
     pub device_name: String,
     pub device_rate: u32,
+    /// Output channels the device was opened with (0 for the silent clock).
+    pub device_channels: u16,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
 }
@@ -239,7 +289,8 @@ impl Player {
         });
         let (tx, rx) = channel();
         let want = session.sample_rate.hz();
-        match open_device(want) {
+        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
+        match open_device(want, want_ch) {
             Ok((device, config, name)) => {
                 let rate = config.sample_rate.0;
                 let channels = usize::from(config.channels);
@@ -257,7 +308,15 @@ impl Player {
                             log::warn!("audio stream failed to start: {e}");
                         }
                         log::info!("audio device: {name} @ {rate} Hz, {channels} ch");
-                        Player { shared, tx, _stream: Some(stream), device_name: name, device_rate: rate, silent: false }
+                        Player {
+                            shared,
+                            tx,
+                            _stream: Some(stream),
+                            device_name: name,
+                            device_rate: rate,
+                            device_channels: config.channels,
+                            silent: false,
+                        }
                     }
                     Err(e) => {
                         log::warn!("cannot open audio stream: {e}; using a silent clock");
@@ -304,12 +363,20 @@ impl Player {
         if let Err(e) = spawn {
             log::warn!("clock thread failed: {e}");
         }
-        Player { shared, tx, _stream: None, device_name: "No audio device (silent)".into(), device_rate: rate, silent: true }
+        Player { shared, tx, _stream: None, device_name: "No audio device (silent)".into(), device_rate: rate, device_channels: 0, silent: true }
     }
 
     #[cfg(target_arch = "wasm32")]
     fn silent_clock_with(shared: Arc<Shared>, tx: Sender<Cmd>, _rx: Receiver<Cmd>, session: Arc<Session>) -> Player {
-        Player { shared, tx, _stream: None, device_name: "No audio device".into(), device_rate: session.sample_rate.hz(), silent: true }
+        Player {
+            shared,
+            tx,
+            _stream: None,
+            device_name: "No audio device".into(),
+            device_rate: session.sample_rate.hz(),
+            device_channels: 0,
+            silent: true,
+        }
     }
 
     pub fn update_session(&self, s: Arc<Session>) {
@@ -360,13 +427,32 @@ impl Player {
     }
 }
 
-fn open_device(want_rate: u32) -> Result<(cpal::Device, cpal::StreamConfig, String), String> {
+/// ITU stereo fold-down gains for each main channel of a session.
+fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
+    let mut g = [(0.0, 0.0); MAX_CHANNELS];
+    let f = s.main_format();
+    let sp = f.speakers();
+    if sp.len() == f.channels() {
+        for (o, x) in g.iter_mut().zip(sp.iter()) {
+            *o = itu_stereo_fold(*x);
+        }
+    } else {
+        // Ambisonics: W only, at -3 dB per side.
+        g[0] = (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+    }
+    g
+}
+
+/// Open the default output device: f32 at the session rate if possible, with as many channels as
+/// it offers up to `want_ch` (at least stereo when available).
+fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::StreamConfig, String), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| "no default output device".to_string())?;
     #[allow(deprecated)]
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
     // Prefer an f32 config at the session rate; else the device default (we resample).
+    let want_ch = want_ch.max(2);
     let mut chosen: Option<cpal::StreamConfig> = None;
     if let Ok(configs) = device.supported_output_configs() {
         for c in configs {
@@ -374,9 +460,10 @@ fn open_device(want_rate: u32) -> Result<(cpal::Device, cpal::StreamConfig, Stri
                 && c.min_sample_rate().0 <= want_rate
                 && c.max_sample_rate().0 >= want_rate
                 && c.channels() >= 2
+                && c.channels() <= want_ch
+                && chosen.as_ref().is_none_or(|x| c.channels() > x.channels)
             {
                 chosen = Some(c.with_sample_rate(cpal::SampleRate(want_rate)).config());
-                break;
             }
         }
     }
@@ -413,6 +500,43 @@ mod tests {
         st.fill(&mut out, 2);
         assert!(shared.position.load(Ordering::Relaxed) >= 1000);
         assert!(!shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn surround_main_maps_to_device_channels_or_folds_down() {
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        s.outputs[0].format = ChannelFormat::Surround51;
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Surround51, None);
+        let chans: Vec<Vec<f32>> = (0..6).map(|c| vec![0.1 * (c + 1) as f32; 48_000]).collect();
+        s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: chans })));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "x", SourceId(5), 0, 0, 48_000));
+        let s = Arc::new(s);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        // An 8-channel device: channels in order, the rest silent.
+        let mut out = vec![0.0f32; 8 * 256];
+        st.fill(&mut out, 8);
+        let f = &out[8 * 100..8 * 101];
+        for c in 0..6 {
+            assert!((f[c] - 0.1 * (c + 1) as f32).abs() < 1e-5, "{f:?}");
+        }
+        assert!(f[6] == 0.0 && f[7] == 0.0);
+        // A stereo device: ITU fold-down.
+        let mut out = vec![0.0f32; 2 * 256];
+        st.fill(&mut out, 2);
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let l = (0.1 + h * 0.3 + h * 0.5f32).min(1.0);
+        assert!((out[200] - l).abs() < 1e-4, "{} vs {l}", out[200]);
+        assert_eq!(shared.meters.lock().unwrap().main.peaks.len(), 6);
     }
 
     #[test]

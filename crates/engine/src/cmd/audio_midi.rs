@@ -24,6 +24,7 @@ fn audio_as_midi(e: &mut Engine, p: &Value) -> Result<Value> {
     if s.track(t).is_none_or(|x| x.kind != soundcraft_model::TrackKind::Audio) {
         return Err(bad(id, "select audio on an audio track"));
     }
+    let r = crate::io::bounded_to_track(s, t, r);
     let audio = soundcraft_mix::render_clips(s, t, r);
     let n = audio.first().map_or(0, Vec::len);
     let k = audio.len().max(1) as f32;

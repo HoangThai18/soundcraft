@@ -129,11 +129,17 @@ pub fn export_midi(e: &Engine) -> Result<Vec<u8>> {
 
 /// Render the main mix. Returns the encoded file and (peak dBFS, integrated LUFS).
 pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool) -> Result<(Vec<u8>, (f32, f32, f32))> {
+    bounce_bytes_with(e, r, opts, normalize, false)
+}
+
+/// Render the main mix in its own format (every main channel, SMPTE/WAV order, with the WAV
+/// speaker mask of the main format), or an ITU stereo fold-down when `fold_stereo`.
+pub fn bounce_bytes_with(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool, fold_stereo: bool) -> Result<(Vec<u8>, (f32, f32, f32))> {
     let s = e.session();
     if r.len() > s.sample_rate.samples(4.0 * 3600.0) {
         return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
     }
-    let mut ch = soundcraft_mix::render_range(s, r, 1024);
+    let (mut ch, fmt) = render_main(s, r, fold_stereo);
     if normalize {
         soundcraft_dsp::offline::normalize(&mut ch, -0.1, false);
     }
@@ -144,13 +150,25 @@ pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool)
     let lufs = lm.integrated_lufs();
     let true_peak = lm.true_peak_db();
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
-    let bytes = soundcraft_audio_io::encode(&buf, opts).map_err(|err| EngineError::Io(err.to_string()))?;
+    let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf, opts, fmt.channel_mask()).map_err(|err| EngineError::Io(err.to_string()))?;
     Ok((bytes, (peak, lufs, true_peak)))
+}
+
+/// The main mix over `r` and its format (folded to stereo on request).
+fn render_main(s: &Session, r: Range, fold_stereo: bool) -> (Vec<Vec<f32>>, ChannelFormat) {
+    let ch = soundcraft_mix::render_range(s, r, 1024);
+    let fmt = if ch.len() <= 2 { ChannelFormat::Stereo } else { s.main_format() };
+    if fold_stereo && ch.len() > 2 { (soundcraft_mix::fold_down_stereo(fmt, &ch), ChannelFormat::Stereo) } else { (ch, fmt) }
 }
 
 /// Bounce one file per audio/instrument track (each soloed, so its sends and auxes are included)
 /// into `dir`. Returns the written paths.
 pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Result<Vec<String>> {
+    bounce_stems_with(e, dir, r, opts, false)
+}
+
+/// [`bounce_stems`] in the main format, or folded down to stereo when `fold_stereo`.
+pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, fold_stereo: bool) -> Result<Vec<String>> {
     let s = e.session();
     std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
     let ext = match opts.format {
@@ -170,9 +188,9 @@ pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Re
         for t in &mut solo.tracks {
             t.mixer.solo = t.id == id;
         }
-        let ch = soundcraft_mix::render_range(&solo, r, 1024);
+        let (ch, fmt) = render_main(&solo, r, fold_stereo);
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
-        let bytes = soundcraft_audio_io::encode(&buf, opts).map_err(|err| EngineError::Io(err.to_string()))?;
+        let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf, opts, fmt.channel_mask()).map_err(|err| EngineError::Io(err.to_string()))?;
         let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
         std::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
         out.push(path.to_string_lossy().into_owned());
@@ -180,15 +198,26 @@ pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Re
     Ok(out)
 }
 
+/// Limit a range used for rendering to the track's material (plus a second), so a huge
+/// selection never renders hours of silence.
+pub fn bounded_to_track(s: &Session, t: TrackId, r: Range) -> Range {
+    let Some(tr) = s.track(t) else { return Range::point(r.start) };
+    let end = tr.clips().iter().map(Clip::end).max().unwrap_or(0).saturating_add(s.sample_rate.samples(1.0));
+    let start = r.start.max(0).min(end);
+    Range::new(start, r.end.min(end).max(start))
+}
+
 /// Transient positions (absolute) in a track's clips within `r`.
 pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Samples> {
     let r = if r.is_empty() { Range::new(0, s.content_end()) } else { r };
+    let r = bounded_to_track(s, t, r);
     let audio = soundcraft_mix::render_clips(s, t, r);
     soundcraft_dsp::offline::detect_transients(&audio, s.sample_rate.as_f64() as f32, sens).into_iter().map(|i| r.start + i as i64).collect()
 }
 
 /// Strip Silence: keep only the non-silent ranges of clips inside `r`.
 pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> usize {
+    let r = bounded_to_track(s, t, r);
     let audio = soundcraft_mix::render_clips(s, t, r);
     let keep = soundcraft_dsp::offline::non_silent_ranges(
         &audio,
@@ -229,6 +258,10 @@ pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: S
 pub fn consolidate(e: &mut Engine, t: TrackId, r: Range) -> Result<bool> {
     let s = e.session();
     if s.track(t).is_none_or(|tr| !tr.kind.has_playlist() || tr.kind.is_midi()) {
+        return Ok(false);
+    }
+    let r = bounded_to_track(s, t, r);
+    if r.is_empty() {
         return Ok(false);
     }
     let audio = soundcraft_mix::render_clips(s, t, r);

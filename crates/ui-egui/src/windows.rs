@@ -403,6 +403,19 @@ pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
         }
         ui.separator();
         ui.label(egui::RichText::new("Outputs").strong());
+        // Main output format: stereo, or a surround format (the mix and master faders follow).
+        let main = app.engine.session().main_format();
+        ui.horizontal(|ui| {
+            ui.label("Main output");
+            egui::ComboBox::from_id_salt("main_output_format").selected_text(main.label()).show_ui(ui, |ui| {
+                for f in soundcraft_model::ChannelFormat::ALL.into_iter().filter(|f| (2..=16).contains(&f.channels())) {
+                    if ui.selectable_label(f == main, f.label()).clicked() && f != main {
+                        let _ = app.run("setup.main_format", json!({"format": f.label()}));
+                    }
+                }
+            });
+            ui.label(egui::RichText::new(format!("{} ch", main.channels())).small());
+        });
         for o in app.engine.session().outputs.clone() {
             ui.label(format!("{} — {} from channel {}", o.name, o.format.label(), o.first_channel + 1));
         }

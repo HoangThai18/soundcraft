@@ -1,11 +1,14 @@
 //! The Mix window: one channel strip per track.
 
 use crate::theme::{Tokens, bold, regular, rgb};
-use crate::widgets::{db_text, fader, meter, pan_knob, pan_text, rec_toggle, selector_box, text_toggle};
+use crate::widgets::{
+    PannerEdit, PannerSpeaker, db_text, fader, meter, multi_meter, pan_knob, pan_text, rec_toggle, selector_box, surround_panner, text_toggle,
+};
 use crate::{SoundApp, panels};
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
-use soundcraft_model::{Route, Track, TrackId, TrackKind};
+use soundcraft_model::{ChannelFormat, Route, SurroundPan, Track, TrackId, TrackKind};
+use soundcraft_playback::MeterSnapshot;
 
 pub fn strip_width(narrow: bool) -> f32 {
     if narrow { 64.0 } else { 98.0 }
@@ -21,15 +24,63 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     }
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.window_bg)).show(ui, |ui| {
         let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden).map(|x| x.id).collect();
+        // Per-channel peaks for multichannel meters (read once per frame).
+        let snap = app
+            .player
+            .as_ref()
+            .filter(|_| app.engine.transport.playing || app.engine.session().tracks.iter().any(|t| t.mixer.input_monitor))
+            .map(|p| p.meters());
         egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
                 for id in ids {
-                    strip(app, ui, id);
+                    strip(app, ui, id, snap.as_ref());
                 }
             });
         });
     });
+}
+
+/// Format of the destination a track's output feeds (the main mix, a bus, or stereo).
+fn output_format(app: &SoundApp, track: &Track) -> ChannelFormat {
+    let s = app.engine.session();
+    match &track.mixer.output {
+        Route::Main => s.main_format(),
+        Route::Bus(b) => s.bus(*b).map_or(ChannelFormat::Stereo, |b| b.format),
+        _ => ChannelFormat::Stereo,
+    }
+}
+
+/// Speaker dots of a format, placed on the panner square.
+fn panner_speakers(fmt: ChannelFormat) -> Vec<PannerSpeaker> {
+    let sp = fmt.speakers();
+    let layout: Vec<soundcraft_dsp::pan::SpeakerPos> =
+        sp.iter().map(|s| soundcraft_dsp::pan::SpeakerPos { az: s.azimuth(), el: s.elevation(), lfe: s.is_lfe() }).collect();
+    sp.iter()
+        .filter(|s| !s.is_lfe())
+        .map(|s| {
+            let (x, y) = soundcraft_dsp::pan::azimuth_to_puck(&layout, s.azimuth());
+            PannerSpeaker { label: s.label(), x, y, height: s.is_height() }
+        })
+        .collect()
+}
+
+/// Ballistic per-channel meter levels for multichannel strips, kept in egui memory.
+fn channel_levels(ui: &Ui, key: (&str, u64), peaks: &[f32], n: usize) -> Vec<f32> {
+    let id = egui::Id::new(key);
+    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.25);
+    let fall = 10f32.powf(-26.0 * dt / 20.0);
+    let mut lv: Vec<f32> = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    lv.resize(n, 0.0);
+    for (i, l) in lv.iter_mut().enumerate() {
+        let p = peaks.get(i).copied().filter(|x| x.is_finite()).unwrap_or(0.0);
+        *l = if p >= *l { p } else { (*l * fall).max(p) };
+        if *l < 1e-5 {
+            *l = 0.0;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(id, lv.clone()));
+    lv
 }
 
 fn section_label(ui: &Ui, r: Rect, text: &str) {
@@ -39,13 +90,13 @@ fn section_label(ui: &Ui, r: Rect, text: &str) {
 fn route_name(app: &SoundApp, r: &Route) -> String {
     match r {
         Route::None => "no output".into(),
-        Route::Main => "Out 1-2".into(),
+        Route::Main => app.engine.session().outputs.first().map_or_else(|| "Out 1-2".into(), |o| o.name.clone()),
         Route::Bus(b) => app.engine.session().bus(*b).map_or_else(|| "bus?".into(), |b| b.name.clone()),
         Route::Hardware(h) => h.clone(),
     }
 }
 
-fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
+fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapshot>) {
     let t = Tokens::DARK;
     let Some(track) = app.engine.session().track(id).cloned() else { return };
     let narrow = app.ui.narrow_mix;
@@ -162,8 +213,31 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(gr));
     let _ = selector_box(&mut c, gr.width(), gr.height(), &gname, t.text_dim);
     y += 22.0;
-    // Pan.
-    if !track.mixer.pan.is_empty() && track.kind != TrackKind::Vca {
+    // Pan: a surround panner when the output is multichannel, else the stereo knobs.
+    let out_fmt = output_format(app, &track);
+    let surround_out =
+        out_fmt.channels() > 2 && !out_fmt.is_ambisonic() && !matches!(track.kind, TrackKind::Master | TrackKind::Vca) && track.channels() <= 2;
+    if surround_out {
+        let size = (inner_w - 4.0).min(88.0);
+        let sp = track.mixer.surround.unwrap_or_else(|| {
+            SurroundPan::from_stereo(if track.mixer.pan.len() == 1 { track.mixer.pan.first().copied().unwrap_or(0.0) } else { 0.0 })
+        });
+        let rows = if out_fmt.has_height() { 2.0 } else { 1.0 };
+        let pr = Rect::from_min_size(pos2(x0 + (inner_w - size) * 0.5, y), vec2(size, size + rows * 11.0));
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(pr).layout(egui::Layout::top_down(egui::Align::Min)));
+        c.spacing_mut().item_spacing.y = 1.0;
+        let speakers = panner_speakers(out_fmt);
+        let z = out_fmt.has_height().then_some(sp.z);
+        if let Some(edit) = surround_panner(&mut c, size, &speakers, (sp.x, sp.y), sp.divergence, z) {
+            let params = match edit {
+                PannerEdit::Position(x, y) => json!({"track": id.0, "x": x, "y": y}),
+                PannerEdit::Divergence(d) => json!({"track": id.0, "divergence": d}),
+                PannerEdit::Height(h) => json!({"track": id.0, "z": h}),
+            };
+            let _ = app.engine.execute_merged("mix.surround_pan", &params, &format!("span:{}", id.0));
+        }
+        y += size + rows * 11.0 + 6.0;
+    } else if !track.mixer.pan.is_empty() && track.kind != TrackKind::Vca {
         let n = track.mixer.pan.len().min(2);
         let ks = if n == 2 { (inner_w / 2.0 - 6.0).min(32.0) } else { 34.0 };
         for i in 0..n {
@@ -214,15 +288,24 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     // Fader + meter.
     let bottom_h = 64.0;
     let fh = (r.max.y - bottom_h - y).max(120.0);
-    let fr = Rect::from_min_size(pos2(x0, y), vec2(inner_w * 0.6, fh));
+    let wide_meter = (if track.kind == TrackKind::Master { app.engine.session().main_format() } else { track.format }).channels() > 2;
+    let fr = Rect::from_min_size(pos2(x0, y), vec2(inner_w * if wide_meter { 0.45 } else { 0.6 }, fh));
     if let Some(db) = fader(ui, fr, track.mixer.volume_db, ui.id().with(("fader", id.0))) {
         app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db });
         let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
     }
     let md = app.meters.get(&id).copied().unwrap_or_default();
     let mr = Rect::from_min_max(pos2(fr.max.x + 4.0, fr.min.y + 6.0), pos2(x0 + inner_w - 2.0, fr.max.y - 6.0));
+    let strip_fmt = if track.kind == TrackKind::Master { app.engine.session().main_format() } else { track.format };
+    let all_chans = strip_fmt.channels().min(soundcraft_mix::MAX_CHANNELS);
     let chans = if track.kind == TrackKind::Master { 2 } else { track.channels().min(2) };
-    if chans >= 2 {
+    if all_chans > 2 {
+        // One bar per channel, labelled (L R C LFE …).
+        let peaks = snap.and_then(|s| s.tracks.get(&id)).map(|m| m.peaks.as_slice()).unwrap_or(&[]);
+        let lv = channel_levels(ui, ("mc_meter", id.0), peaks, all_chans);
+        let labels: Vec<String> = (0..all_chans).map(|c| strip_fmt.channel_label(c)).collect();
+        multi_meter(ui, mr, &lv, &labels, md.clip);
+    } else if chans >= 2 {
         let mw = mr.width() / 2.0 - 1.0;
         meter(ui, Rect::from_min_size(mr.min, vec2(mw, mr.height())), md.level[0], md.hold[0], md.clip);
         meter(ui, Rect::from_min_size(pos2(mr.min.x + mw + 2.0, mr.min.y), vec2(mw, mr.height())), md.level[1], md.hold[1], md.clip);
@@ -336,11 +419,23 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
             }
         }
     });
+    // Third-party VST3 plugins (scanned once, cached by soundcraft-vst3-host).
+    ui.menu_button("VST3", |ui| {
+        let found: Vec<_> = soundcraft_vst3_host::scan().into_iter().filter(|d| !d.is_instrument).collect();
+        if found.is_empty() {
+            ui.label("No VST3 plugins found");
+        }
+        for d in found {
+            if ui.button(format!("{} ({})", d.name, d.vendor)).clicked() {
+                let _ = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": d.id}));
+            }
+        }
+    });
 }
 
-/// A built-in plugin's description, else a hosted CLAP plugin's (`clap:<id>`).
+/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`) or VST3 (`vst3:<class id>`) plugin's.
 pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
-    soundcraft_dsp::plugin_info(id).or_else(|| soundcraft_clap_host::plugin_info(id))
+    soundcraft_dsp::plugin_info(id).or_else(|| soundcraft_clap_host::plugin_info(id)).or_else(|| soundcraft_vst3_host::plugin_info(id))
 }
 
 fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
@@ -406,7 +501,8 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
     if ui.button(if input { "no input" } else { "no output" }).clicked() {
         let _ = app.run(cmd, json!({"track": id.0, key: "none"}));
     }
-    if !input && ui.button("Out 1-2").clicked() {
+    let main_name = app.engine.session().outputs.first().map_or_else(|| "Out 1-2".to_string(), |o| o.name.clone());
+    if !input && ui.button(main_name).clicked() {
         let _ = app.run(cmd, json!({"track": id.0, key: "main"}));
     }
     if input {

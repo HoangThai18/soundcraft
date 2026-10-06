@@ -18,7 +18,9 @@ pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint}
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};
-pub use mixer::{Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, fader_db_to_pos, fader_pos_to_db};
+pub use mixer::{
+    Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
+};
 pub use session::{BitDepthSetting, EditMode, EditState, SESSION_EXTENSION, Session, SessionError, Tool, TrackView, ZoomState};
 pub use source::{Source, SourceAudio, SourcePool};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};

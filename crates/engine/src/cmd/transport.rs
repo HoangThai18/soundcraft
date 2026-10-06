@@ -24,13 +24,13 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "transport.go_to_end", "Go to End", [], Some("End"), "{}", always, |e, _| { let end = e.session().content_end(); locate(e, end) }),
         cmd!(noundo "transport.rewind", "Rewind", [], None, "{seconds?: 1}", always, |e, p| {
             let s = e.session();
-            let d = s.sample_rate.samples(f64_or(p, "seconds", 1.0));
+            let d = s.sample_rate.samples(f64_or(p, "seconds", 1.0).clamp(0.0, 86_400.0));
             let at = (cur(e) - d).max(0);
             locate(e, at)
         }),
         cmd!(noundo "transport.fast_forward", "Fast Forward", [], None, "{seconds?: 1}", always, |e, p| {
             let s = e.session();
-            let d = s.sample_rate.samples(f64_or(p, "seconds", 1.0));
+            let d = s.sample_rate.samples(f64_or(p, "seconds", 1.0).clamp(0.0, 86_400.0));
             let at = cur(e) + d;
             locate(e, at)
         }),
