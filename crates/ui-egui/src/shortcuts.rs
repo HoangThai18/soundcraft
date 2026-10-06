@@ -155,6 +155,8 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
             let _ = app.run(id, json!({}));
             true
         }
+        // Commands Keyboard Focus: single-key editing (Edit window only).
+        k if plain && app.ui.window == MainWindow::Edit && app.engine.session().edit.keyboard_focus == "commands" && commands_focus(app, k) => true,
         Key::R | Key::T if plain => {
             // Zoom out / in on the timeline (Commands Focus style).
             let id = if key == Key::T { "view.zoom_in" } else { "view.zoom_out" };
@@ -162,5 +164,62 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Single-key commands. Returns true when `key` was handled.
+fn commands_focus(app: &mut SoundApp, key: Key) -> bool {
+    let id = match key {
+        Key::A => "edit.trim_start_to_insertion",
+        Key::S => "edit.trim_end_to_insertion",
+        Key::D => "edit.fade_to_start",
+        Key::G => "edit.fade_to_end",
+        Key::F => "edit.fades_create",
+        Key::B => "edit.separate",
+        Key::X => "edit.cut",
+        Key::C => "edit.copy",
+        Key::V => "edit.paste",
+        Key::Z => "edit.undo",
+        Key::P => {
+            move_selection_track(app, -1);
+            return true;
+        }
+        Key::Semicolon => {
+            move_selection_track(app, 1);
+            return true;
+        }
+        Key::L | Key::Quote => {
+            tab_clip(app, key == Key::L);
+            return true;
+        }
+        _ => return false,
+    };
+    let _ = app.run(id, json!({}));
+    true
+}
+
+/// Move the edit selection to the track above/below (P / ;).
+fn move_selection_track(app: &mut SoundApp, dir: i64) {
+    let s = app.engine.session();
+    let visible: Vec<u64> = s.tracks.iter().filter(|t| !t.hidden).map(|t| t.id.0).collect();
+    let Some(cur) = s.edit.selected_tracks.first().map(|t| t.0) else { return };
+    let Some(i) = visible.iter().position(|t| *t == cur) else { return };
+    let j = (i as i64 + dir).clamp(0, visible.len() as i64 - 1) as usize;
+    if let Some(t) = visible.get(j) {
+        let sel = s.edit.selection;
+        let _ = app.run("edit.select", json!({"tracks": [t], "start": sel.start, "end": sel.end, "exact": true}));
+    }
+}
+
+/// Tab to the previous/next clip boundary on the selected tracks (L / ').
+fn tab_clip(app: &mut SoundApp, back: bool) {
+    let s = app.engine.session();
+    let at = s.edit.selection.start;
+    let mut edges: Vec<i64> =
+        s.tracks.iter().filter(|t| s.edit.selected_tracks.contains(&t.id)).flat_map(|t| t.clips().iter().flat_map(|c| [c.start, c.end()])).collect();
+    edges.sort_unstable();
+    let next = if back { edges.iter().rev().find(|e| **e < at).copied() } else { edges.iter().find(|e| **e > at).copied() };
+    if let Some(n) = next {
+        let _ = app.run("transport.locate", json!({"at": n}));
     }
 }
