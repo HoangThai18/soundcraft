@@ -63,7 +63,6 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("View > Rulers > Meter", "view.ruler"),
     ("View > Rulers > Markers", "view.ruler"),
     ("View > Rulers > Chord Symbols", "view.ruler"),
-    ("Window > Undo History", "engine.history"),
 ];
 
 pub fn catalog() -> Vec<&'static str> {
