@@ -17,6 +17,8 @@ pub struct MidiEditorState {
     pub drag: Option<NoteDrag>,
     pub top_pitch: i32,
     pub clip: Option<ClipId>,
+    /// Rubber-band selection start (screen position).
+    pub band: Option<egui::Pos2>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,10 +72,36 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     ui.painter().text(
         pos2(header.min.x + 110.0, header.center().y),
         Align2::LEFT_CENTER,
-        format!("{} · {} notes · click: add · drag: move · edge: resize · Delete: remove", clip.name, sequence.notes.len()),
+        format!(
+            "{} · {} notes · {} selected · click: add · drag: move/select · arrows: move · Delete: remove",
+            clip.name,
+            sequence.notes.len(),
+            app.midi.selected.len()
+        ),
         regular(11.0),
         t.text_dim,
     );
+    // Header toolbar: whole-clip MIDI operations.
+    let bar = Rect::from_min_max(pos2(header.max.x - 330.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
+    let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    tb.spacing_mut().item_spacing.x = 4.0;
+    let mut op: Option<(&str, serde_json::Value)> = None;
+    if tb.small_button("Legato").clicked() {
+        op = Some(("event.change_duration", json!({"legato": 0})));
+    }
+    if tb.small_button("Vel −10").clicked() {
+        op = Some(("event.change_velocity", json!({"add": -10})));
+    }
+    if tb.small_button("Vel +10").clicked() {
+        op = Some(("event.change_velocity", json!({"add": 10})));
+    }
+    if tb.small_button("Quantize").on_hover_text("Quantize to the grid").clicked() {
+        op = Some(("event.quantize", json!({"grid": "1/16", "strength": 100})));
+    }
+    if let Some((id, mut p)) = op {
+        p["clips"] = json!([cid.0]);
+        let _ = app.run(id, p);
+    }
     let s = app.engine.session().clone();
     let sr = s.sample_rate;
     let base_tick = s.tempo.samples_to_ticks(clip.start, sr);
@@ -187,12 +215,42 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let snap = |tk: f32| -> i64 { ((tk / grid_ticks as f32).round() as i64) * grid_ticks };
     if resp.drag_started()
         && let Some(p) = resp.interact_pointer_pos()
-        && let Some((i, edge)) = hit(p)
     {
-        if !app.midi.selected.contains(&i) {
-            app.midi.selected = vec![i];
+        if let Some((i, edge)) = hit(p) {
+            if !app.midi.selected.contains(&i) {
+                app.midi.selected = vec![i];
+            }
+            app.midi.drag = Some(NoteDrag { index: i, resize: edge, start: p, dx_ticks: 0, dy_semi: 0 });
+        } else {
+            app.midi.band = Some(p);
         }
-        app.midi.drag = Some(NoteDrag { index: i, resize: edge, start: p, dx_ticks: 0, dy_semi: 0 });
+    }
+    // Rubber-band selection on empty space.
+    if let (Some(a), Some(b)) = (app.midi.band, ui.ctx().pointer_latest_pos()) {
+        let band = Rect::from_two_pos(a, b);
+        ui.painter().rect(
+            band,
+            0.0,
+            Color32::from_rgba_unmultiplied(120, 170, 255, 40),
+            Stroke::new(1.0, Color32::from_rgb(120, 170, 255)),
+            StrokeKind::Inside,
+        );
+        if resp.drag_stopped() {
+            app.midi.selected = sequence
+                .notes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    let r = Rect::from_min_max(
+                        pos2(x_of(n.start), y_of(i32::from(n.pitch))),
+                        pos2(x_of(n.start + n.length), y_of(i32::from(n.pitch)) + ROW_H),
+                    );
+                    r.intersects(band)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            app.midi.band = None;
+        }
     }
     if resp.dragged()
         && let (Some(d), Some(p)) = (&mut app.midi.drag, resp.interact_pointer_pos())
@@ -235,6 +293,39 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 );
                 app.midi.selected.clear();
             }
+        }
+    }
+    // Keyboard: Cmd+A select all; arrows transpose (Shift = octave) and move by the grid.
+    if ui.rect_contains_pointer(roll) && !ui.ctx().egui_wants_keyboard_input() {
+        let (all, up, down, left, right, shift) = ui.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.modifiers.shift,
+            )
+        });
+        if all {
+            app.midi.selected = (0..sequence.notes.len()).collect();
+        }
+        let semi = if up {
+            1
+        } else if down {
+            -1
+        } else {
+            0
+        } * if shift { 12 } else { 1 };
+        let ticks = if right {
+            grid_ticks
+        } else if left {
+            -grid_ticks
+        } else {
+            0
+        };
+        if (semi != 0 || ticks != 0) && !app.midi.selected.is_empty() {
+            let _ = app.run("midi.notes_move", json!({"clip": cid.0, "indices": app.midi.selected, "ticks": ticks, "semitones": semi}));
         }
     }
     if !app.midi.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
