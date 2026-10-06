@@ -46,6 +46,9 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.arrange_cascade", "Cascade", "Window > Arrange > Cascade", None),
     ("window.midi_front", "MIDI Editors to Front", "Window > MIDI Editors > Bring to Front", None),
     ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
+    ("window.playback_engine", "Playback Engine", "", None),
+    ("window.io_setup", "I/O Setup", "", None),
+    ("window.shortcuts", "Keyboard Shortcuts", "", None),
     ("view.mix_section", "Mix Window View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
     ("ui.bounce_dialog", "Bounce Mix…", "", None),
@@ -61,6 +64,7 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
         v.push((Box::leak(format!("View > Mix Window Views > {sec}").into_boxed_str()), "view.mix_section"));
     }
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
+    v.extend(MENU_WINDOWS.iter().copied());
     v
 }
 
@@ -200,7 +204,7 @@ fn menu_node(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str
         });
         return;
     }
-    let id = catalog::implemented_by(&n.path, extra);
+    let id = catalog::implemented_by(&n.path, extra).or_else(|| MENU_WINDOWS.iter().find(|(p, _)| *p == n.path).map(|(_, w)| w.to_string()));
     let enabled = match id.as_deref() {
         Some(i) if i.starts_with("window.") || i.starts_with("view.mix_section") || i == "audiosuite.process" => true,
         Some(i) => soundcraft_engine::find_command(i).is_some_and(|c| (c.enabled)(&app.engine).is_ok()),
@@ -299,8 +303,23 @@ fn params_for(path: &str, id: &str) -> Value {
     }
 }
 
+/// Menu items that open a SoundCraft window when clicked (programmatic calls still run the command).
+const MENU_WINDOWS: &[(&str, &str)] = &[
+    ("Setup > Hardware...", "window.playback_engine"),
+    ("Setup > Playback Engine...", "window.playback_engine"),
+    ("Setup > I/O...", "window.io_setup"),
+    ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
+    ("Setup > Session", "setup.session"),
+];
+
 /// Menu-style invocation: may open a dialog.
 pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
+    if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path) {
+        if w.starts_with("window.") {
+            let _ = app.run(w, json!({"value": true}));
+            return;
+        }
+    }
     if id == "audiosuite.process" {
         let p = params_for(path, id);
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);
@@ -352,6 +371,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             json!({})
         }
         "window.automation" => toggle(&mut app.ui.show_automation),
+        "window.playback_engine" => toggle(&mut app.ui.show_playback_engine),
+        "window.io_setup" => toggle(&mut app.ui.show_io_setup),
+        "window.shortcuts" => toggle(&mut app.ui.show_shortcuts),
         "window.color_palette" => toggle(&mut app.ui.show_color_palette),
         "window.disk_usage" => toggle(&mut app.ui.show_disk_usage),
         "window.system_usage" => toggle(&mut app.ui.show_system_usage),

@@ -27,19 +27,35 @@ pub struct StripMeter {
 struct PluginSlot {
     id: String,
     plugin: Box<dyn Plugin>,
+    /// Last values pushed to the plugin, in the insert's parameter-map order.
+    applied: Vec<f32>,
 }
 
 struct Strip {
     buf: Vec<Vec<f32>>,
+    /// Pre-fader copy for pre-fader sends.
+    pre: Vec<Vec<f32>>,
+    scratch: Vec<f32>,
     plugins: Vec<Option<PluginSlot>>,
     instrument: Option<PluginSlot>,
     /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
     held: Vec<u8>,
+    muted: bool,
+    gr: f32,
 }
 
 impl Strip {
     fn new() -> Self {
-        Strip { buf: Vec::new(), plugins: Vec::new(), instrument: None, held: Vec::new() }
+        Strip {
+            buf: Vec::new(),
+            pre: Vec::new(),
+            scratch: Vec::new(),
+            plugins: Vec::new(),
+            instrument: None,
+            held: Vec::new(),
+            muted: false,
+            gr: 0.0,
+        }
     }
 }
 
@@ -50,12 +66,14 @@ pub struct MixEngine {
     strips: HashMap<TrackId, Strip>,
     busses: HashMap<BusId, Vec<Vec<f32>>>,
     main: Vec<Vec<f32>>,
-    scratch: Vec<f32>,
     pub meters: HashMap<TrackId, StripMeter>,
     pub main_meter: StripMeter,
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
     last_end: Samples,
+    /// Snapshot key of the session the strips/order were synced to.
+    synced: (usize, usize, usize),
+    order: Vec<usize>,
 }
 
 impl MixEngine {
@@ -67,11 +85,12 @@ impl MixEngine {
             strips: HashMap::new(),
             busses: HashMap::new(),
             main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
-            scratch: vec![0.0; max_block],
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
             last_end: 0,
+            synced: (0, 0, 0),
+            order: Vec::new(),
         }
     }
 
@@ -113,7 +132,7 @@ impl MixEngine {
                     Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin) => {
                         *slot = soundcraft_dsp::create(&i.plugin).map(|mut p| {
                             p.prepare(sr, mb, ch);
-                            PluginSlot { id: i.plugin.clone(), plugin: p }
+                            PluginSlot { id: i.plugin.clone(), plugin: p, applied: Vec::new() }
                         });
                     }
                     None => *slot = None,
@@ -125,7 +144,7 @@ impl MixEngine {
                 strip.instrument = want.and_then(|id| {
                     soundcraft_dsp::create(id).map(|mut p| {
                         p.prepare(sr, mb, ch.max(2));
-                        PluginSlot { id: id.to_string(), plugin: p }
+                        PluginSlot { id: id.to_string(), plugin: p, applied: Vec::new() }
                     })
                 });
             }
@@ -149,7 +168,13 @@ impl MixEngine {
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
-        self.sync(s);
+        // Re-sync plugin instances and routing order only when the session snapshot changes.
+        let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
+        if key != self.synced {
+            self.sync(s);
+            self.order = processing_order(s);
+            self.synced = key;
+        }
         for b in self.busses.values_mut() {
             for c in b.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -159,14 +184,42 @@ impl MixEngine {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
         }
         let any_solo = s.tracks.iter().any(|t| t.mixer.solo && !t.inactive);
-        let order = processing_order(s);
-        for idx in order {
-            let Some(t) = s.tracks.get(idx) else { continue };
-            if t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca {
-                continue;
+        let order = std::mem::take(&mut self.order);
+        let live = |t: &&Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
+        let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
+        // Phase 1: independent strips (audio, instrument, MIDI) in parallel.
+        let mut work: Vec<(&Track, Strip)> = order
+            .iter()
+            .filter_map(|&i| s.tracks.get(i))
+            .filter(live)
+            .filter(|t| !is_aux(t))
+            .filter_map(|t| self.strips.remove(&t.id).map(|st| (t, st)))
+            .collect();
+        for (_, st) in work.iter_mut() {
+            if st.scratch.len() < self.max_block {
+                st.scratch.resize(self.max_block, 0.0);
             }
-            self.render_track(s, t, pos, frames, any_solo);
         }
+        let busses = std::mem::take(&mut self.busses);
+        run_strips(&mut work, |(t, st)| process_strip(s, t, st, &busses, pos, frames, any_solo));
+        self.busses = busses;
+        for (t, st) in &work {
+            self.route_strip(t, st, pos, frames);
+        }
+        for (t, st) in work {
+            self.strips.insert(t.id, st);
+        }
+        // Phase 2: auxes in dependency order (they read busses).
+        for t in order.iter().filter_map(|&i| s.tracks.get(i)).filter(live).filter(|t| is_aux(t)) {
+            let Some(mut st) = self.strips.remove(&t.id) else { continue };
+            if st.scratch.len() < self.max_block {
+                st.scratch.resize(self.max_block, 0.0);
+            }
+            process_strip(s, t, &mut st, &self.busses, pos, frames, any_solo);
+            self.route_strip(t, &st, pos, frames);
+            self.strips.insert(t.id, st);
+        }
+        self.order = order;
         // Master faders process the main mix.
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
@@ -219,124 +272,23 @@ impl MixEngine {
         self.main_meter = StripMeter { peak: pk, gain_reduction_db: 0.0 };
     }
 
-    fn render_track(&mut self, s: &Session, t: &Track, pos: Samples, frames: usize, any_solo: bool) {
-        let Some(strip) = self.strips.get_mut(&t.id) else { return };
-        for c in strip.buf.iter_mut() {
-            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-        }
-        // 1. Source: clips, bus input or instrument.
-        match t.kind {
-            TrackKind::Audio => {
-                for clip in t.clips() {
-                    if clip.muted || !clip.is_audio() {
-                        continue;
-                    }
-                    render_clip(s, clip, pos, frames, &mut strip.buf, &mut self.scratch);
-                }
-            }
-            TrackKind::Aux | TrackKind::Folder => {
-                if let Route::Bus(b) = &t.mixer.input
-                    && let Some(src) = self.busses.get(b)
-                {
-                    let nch = strip.buf.len();
-                    for (ch, dst) in strip.buf.iter_mut().enumerate() {
-                        for i in 0..frames {
-                            let v = if nch == 1 {
-                                0.5 * (src.first().and_then(|c| c.get(i)).copied().unwrap_or(0.0)
-                                    + src.get(1).and_then(|c| c.get(i)).copied().unwrap_or(0.0))
-                            } else {
-                                src.get(ch.min(1)).and_then(|c| c.get(i)).copied().unwrap_or(0.0)
-                            };
-                            if let Some(d) = dst.get_mut(i) {
-                                *d = v;
-                            }
-                        }
-                    }
-                }
-            }
-            TrackKind::Instrument | TrackKind::Midi => {
-                if let Some(inst) = &mut strip.instrument {
-                    schedule_notes(s, t, pos, frames, inst, &mut strip.held);
-                    let mut tmp = std::mem::take(&mut strip.buf);
-                    if tmp.len() >= 2 {
-                        inst.plugin.process(&mut tmp, frames);
-                    } else if let Some(c0) = tmp.first_mut() {
-                        // Mono MIDI track: render the instrument in stereo into scratch and fold.
-                        let mut st = [std::mem::take(c0), std::mem::take(&mut self.scratch)];
-                        inst.plugin.process(&mut st, frames);
-                        let [a, b] = st;
-                        *c0 = a;
-                        self.scratch = b;
-                        for (x, y) in c0.iter_mut().zip(self.scratch.iter()).take(frames) {
-                            *x = 0.5 * (*x + *y);
-                        }
-                    }
-                    strip.buf = tmp;
-                }
-            }
-            _ => {}
-        }
-        // 2. Trim + phase.
-        let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
-        if (trim - 1.0).abs() > f32::EPSILON {
-            for c in strip.buf.iter_mut() {
-                c.iter_mut().take(frames).for_each(|x| *x *= trim);
-            }
-        }
-        // 3. Inserts.
-        let mut gr = 0.0f32;
-        for (i, ins) in t.mixer.inserts.iter().enumerate() {
-            let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
-            if !ins.active || ins.bypass {
-                continue;
-            }
-            apply_params(slot, ins, t, i, pos);
-            slot.plugin.process(&mut strip.buf, frames);
-            if gr == 0.0 {
-                gr = slot.plugin.gain_reduction_db();
-            }
-        }
-        // 4. Mute (static, automation, solo).
-        let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
-        let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
-        let muted = t.mixer.mute || auto_mute || soloed_out;
-        // Pre-fader sends.
-        for (i, snd) in t.mixer.sends.iter().enumerate() {
-            let Some(snd) = snd else { continue };
-            if !snd.pre_fader || snd.mute || muted {
-                continue;
-            }
-            let lvl = send_level(t, i, snd.level_db, pos);
-            mix_to_bus(&strip.buf, frames, &mut self.busses, &snd.target, db_to_gain(lvl), snd.pan, self.pan_law, &t.mixer.pan);
-        }
-        // 5. Fader.
-        let v0 = volume_db_at(t, pos);
-        let v1 = volume_db_at(t, pos + frames as i64);
-        let (g0, g1) = if muted { (-144.0, -144.0) } else { (v0, v1) };
-        for c in strip.buf.iter_mut() {
-            for i in 0..frames {
-                if let Some(x) = c.get_mut(i) {
-                    *x *= lerp_gain(g0, g1, i, frames);
-                }
-            }
-        }
-        // Meters (post-fader, pre-pan).
+    /// Send, meter and pan a processed strip into the busses / main mix.
+    fn route_strip(&mut self, t: &Track, strip: &Strip, pos: Samples, frames: usize) {
         let mut pk = [0.0f32; 2];
         for (c, p) in pk.iter_mut().enumerate() {
             let ch = c.min(strip.buf.len().saturating_sub(1));
             *p = strip.buf.get(ch).map_or(0.0, |b| peak(b.get(..frames).unwrap_or(&[])));
         }
-        self.meters.insert(t.id, StripMeter { peak: pk, gain_reduction_db: gr });
-        // Post-fader sends.
+        self.meters.insert(t.id, StripMeter { peak: pk, gain_reduction_db: strip.gr });
         for (i, snd) in t.mixer.sends.iter().enumerate() {
             let Some(snd) = snd else { continue };
-            if snd.pre_fader || snd.mute || muted {
+            if snd.mute || strip.muted {
                 continue;
             }
             let lvl = send_level(t, i, snd.level_db, pos);
-            mix_to_bus(&strip.buf, frames, &mut self.busses, &snd.target, db_to_gain(lvl), snd.pan, self.pan_law, &t.mixer.pan);
+            let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
+            mix_to_bus(src, frames, &mut self.busses, &snd.target, db_to_gain(lvl), snd.pan, self.pan_law, &t.mixer.pan);
         }
-        // 6. Pan to output.
         let pans: [f32; 2] = [pan_at(t, 0, pos), pan_at(t, 1, pos)];
         match &t.mixer.output {
             Route::Main => pan_into(&strip.buf, frames, &mut self.main, &pans, self.pan_law),
@@ -348,6 +300,143 @@ impl MixEngine {
             _ => {}
         }
     }
+}
+
+/// Source → trim → inserts → (pre-fader copy) → mute/fader for one strip. Independent of other
+/// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
+fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &HashMap<BusId, Vec<Vec<f32>>>, pos: Samples, frames: usize, any_solo: bool) {
+    for c in strip.buf.iter_mut() {
+        c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+    }
+    match t.kind {
+        TrackKind::Audio => {
+            for clip in t.clips() {
+                if clip.muted || !clip.is_audio() {
+                    continue;
+                }
+                render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch);
+            }
+        }
+        TrackKind::Aux | TrackKind::Folder => {
+            if let Route::Bus(b) = &t.mixer.input
+                && let Some(src) = busses.get(b)
+            {
+                let nch = strip.buf.len();
+                for (ch, dst) in strip.buf.iter_mut().enumerate() {
+                    for i in 0..frames {
+                        let v = if nch == 1 {
+                            0.5 * (src.first().and_then(|c| c.get(i)).copied().unwrap_or(0.0)
+                                + src.get(1).and_then(|c| c.get(i)).copied().unwrap_or(0.0))
+                        } else {
+                            src.get(ch.min(1)).and_then(|c| c.get(i)).copied().unwrap_or(0.0)
+                        };
+                        if let Some(d) = dst.get_mut(i) {
+                            *d = v;
+                        }
+                    }
+                }
+            }
+        }
+        TrackKind::Instrument | TrackKind::Midi => {
+            if let Some(inst) = &mut strip.instrument {
+                schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+                if strip.buf.len() >= 2 {
+                    inst.plugin.process(&mut strip.buf, frames);
+                } else if let Some(c0) = strip.buf.first_mut() {
+                    // Mono MIDI track: render the instrument in stereo and fold.
+                    let mut st = [std::mem::take(c0), std::mem::take(&mut strip.scratch)];
+                    inst.plugin.process(&mut st, frames);
+                    let [a, b] = st;
+                    *c0 = a;
+                    strip.scratch = b;
+                    for (x, y) in c0.iter_mut().zip(strip.scratch.iter()).take(frames) {
+                        *x = 0.5 * (*x + *y);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
+    if (trim - 1.0).abs() > f32::EPSILON {
+        for c in strip.buf.iter_mut() {
+            c.iter_mut().take(frames).for_each(|x| *x *= trim);
+        }
+    }
+    let mut gr = 0.0f32;
+    for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
+        if !ins.active || ins.bypass {
+            continue;
+        }
+        apply_params(slot, ins, t, i, pos);
+        slot.plugin.process(&mut strip.buf, frames);
+        if gr == 0.0 {
+            gr = slot.plugin.gain_reduction_db();
+        }
+    }
+    strip.gr = gr;
+    let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
+    let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
+    strip.muted = t.mixer.mute || auto_mute || soloed_out;
+    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
+        strip.pre.resize_with(strip.buf.len(), Vec::new);
+        for (d, src) in strip.pre.iter_mut().zip(strip.buf.iter()) {
+            d.clear();
+            d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
+        }
+    }
+    let v0 = volume_db_at(t, pos);
+    let v1 = volume_db_at(t, pos + frames as i64);
+    let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0, v1) };
+    for c in strip.buf.iter_mut() {
+        for i in 0..frames {
+            if let Some(x) = c.get_mut(i) {
+                *x *= lerp_gain(g0, g1, i, frames);
+            }
+        }
+    }
+}
+
+/// Hash of everything `sync`/`processing_order` depend on (tracks, kinds, routing, plugins, sends).
+fn structure_fingerprint(s: &Session) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in &s.tracks {
+        t.id.hash(&mut h);
+        t.kind.hash(&mut h);
+        t.format.hash(&mut h);
+        t.inactive.hash(&mut h);
+        t.mixer.input.hash(&mut h);
+        t.mixer.output.hash(&mut h);
+        for i in &t.mixer.inserts {
+            i.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+        }
+        for snd in t.mixer.sends.iter().flatten() {
+            snd.target.hash(&mut h);
+        }
+        t.instrument.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+    }
+    for b in &s.busses {
+        b.id.hash(&mut h);
+    }
+    h.finish() as usize
+}
+
+/// Process strips, in parallel on native targets when there are enough of them.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+    use rayon::prelude::*;
+    if work.len() >= 4 {
+        work.par_iter_mut().for_each(f);
+    } else {
+        work.iter_mut().for_each(f);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+    work.iter_mut().for_each(f);
 }
 
 fn strip_channels(t: &Track) -> usize {
@@ -484,18 +573,23 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
 }
 
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
-    for (k, v) in &ins.params {
+    let slot_u8 = u8::try_from(i).unwrap_or(0);
+    let automated = t.mixer.automation_mode.reads()
+        && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
+    if slot.applied.len() != ins.params.len() {
+        slot.applied = vec![f32::NAN; ins.params.len()];
+    }
+    for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
         let mut val = *v;
-        if t.mixer.automation_mode.reads() {
-            let slot_u8 = u8::try_from(i).unwrap_or(0);
-            if let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
-                && !l.points.is_empty()
-            {
-                val = l.value_at(pos, val);
-            }
+        if automated
+            && let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
+            && !l.points.is_empty()
+        {
+            val = l.value_at(pos, val);
         }
-        if slot.plugin.param(k) != Some(val) {
+        if val.to_bits() != last.to_bits() {
             slot.plugin.set_param(k, val);
+            *last = val;
         }
     }
 }

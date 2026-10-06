@@ -118,6 +118,14 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({"deleted": n}))
         }),
+        cmd!(noundo "track.folder_toggle", "Open/Close Folder", [], None, "{track, open?: bool}", has_tracks, |e, p| {
+            let t = track_param(e, "track.folder_toggle", p, "track")?.ok_or_else(|| bad("track.folder_toggle", "`track` required"))?;
+            let v = p.get("open").and_then(Value::as_bool);
+            let s = e.session_mut();
+            let tr = s.track_mut(t).ok_or_else(|| bad("track.folder_toggle", "no track"))?;
+            tr.folder_open = v.unwrap_or(!tr.folder_open);
+            Ok(json!({"open": tr.folder_open}))
+        }),
         cmd!("track.input", "Track Input", [], None, "{tracks?, input: none|bus name|hardware name}", has_selection, |e, p| route(e, p, true)),
         cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name}", has_selection, |e, p| route(e, p, false)),
         cmd!("track.timebase", "Track Timebase", [], None, "{tracks?, ticks: bool}", has_selection, |e, p| flag(
