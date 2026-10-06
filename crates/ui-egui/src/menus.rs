@@ -48,6 +48,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
     ("window.clip_effects", "Clip Effects", "Window > Clip Effects", None),
     ("window.clip_effects_dock", "Clip Effects", "View > Other Displays > Lower Dock > Clip Effects", None),
+    ("window.search", "Search", "Window > Pro Tools Search", Some("Cmd+Ctrl+S")),
     ("window.score", "Score Editor", "Window > Score Editor", Some("Cmd+Ctrl+=")),
     ("window.beat_detective", "Beat Detective", "", None),
     ("window.tempo_ops", "Tempo Operations", "", None),
@@ -385,6 +386,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         }
         "window.automation" => toggle(&mut app.ui.show_automation),
         "window.clip_effects" | "window.clip_effects_dock" => toggle(&mut app.ui.show_clip_effects),
+        "window.search" => toggle(&mut app.ui.show_search),
         "window.score" => toggle(&mut app.ui.show_score),
         "window.beat_detective" => toggle(&mut app.ui.show_beat_detective),
         "window.tempo_ops" => toggle(&mut app.ui.show_tempo_ops),
