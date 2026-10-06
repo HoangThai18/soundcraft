@@ -95,6 +95,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
         cmd!("mix.insert_param", "Set Plugin Parameter", [], None, "{track?, slot, param, value}", has_selection, insert_param),
+        cmd!(
+            "mix.insert_params",
+            "Set Plugin Parameters",
+            [],
+            None,
+            "{track?, slot, params: {id: value}, preset?: name}",
+            has_selection,
+            insert_params
+        ),
         cmd!("mix.insert_move", "Move Insert", [], None, "{track?, from, to}", has_selection, insert_move),
         cmd!("mix.send", "Assign Send", [], None, "{track?, slot?: 0..9|a..j, bus: name, level_db?: 0, pre_fader?: false}", has_selection, send),
         cmd!("mix.send_remove", "Remove Send", [], None, "{track?, slot}", has_selection, |e, p| {
@@ -341,6 +350,30 @@ fn insert_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let v = value.clamp(pi.min, pi.max);
     ins.params.insert(param, v);
     Ok(json!({"value": v}))
+}
+
+/// Apply many parameters at once (preset recall); unknown ids are ignored, values clamped.
+fn insert_params(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (t, slot) = track_slot(e, p, "mix.insert_params", INSERT_SLOTS)?;
+    let obj = p.get("params").and_then(Value::as_object).cloned().ok_or_else(|| bad("mix.insert_params", "`params` must be an object"))?;
+    let preset = str_param(p, "preset").map(str::to_string);
+    let s = e.session_mut();
+    let ins = s
+        .track_mut(t)
+        .and_then(|tr| tr.mixer.inserts.get_mut(slot))
+        .and_then(Option::as_mut)
+        .ok_or_else(|| bad("mix.insert_params", "empty slot"))?;
+    let info = super::clap::plugin_info(&ins.plugin).ok_or_else(|| bad("mix.insert_params", "unknown plugin"))?;
+    let mut n = 0;
+    for (k, v) in obj {
+        let (Some(pi), Some(f)) = (info.params.iter().find(|x| x.id == k), v.as_f64().filter(|f| f.is_finite())) else { continue };
+        ins.params.insert(k, (f as f32).clamp(pi.min, pi.max));
+        n += 1;
+    }
+    if let Some(name) = preset {
+        ins.preset = name;
+    }
+    Ok(json!({"set": n}))
 }
 
 fn insert_move(e: &mut Engine, p: &Value) -> Result<Value> {
