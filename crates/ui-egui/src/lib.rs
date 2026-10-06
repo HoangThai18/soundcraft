@@ -155,6 +155,7 @@ pub struct SoundApp {
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
     record_start: Samples,
+    recorder_failed: bool,
     pub ui: UiState,
     pub services: Services,
     pub dialogs: dialogs::Dialogs,
@@ -188,6 +189,7 @@ impl SoundApp {
             player,
             recorder: None,
             record_start: 0,
+            recorder_failed: false,
             ui: UiState::default(),
             services,
             dialogs: dialogs::Dialogs::default(),
@@ -280,14 +282,13 @@ impl SoundApp {
             self.ui.status = "Record-enable a track first (the red button in its header).".into();
             return;
         }
-        if self.recorder.is_none() && self.player.is_some() {
-            match soundcraft_playback::record::Recorder::open() {
-                Ok(r) => self.recorder = Some(r),
-                Err(e) => {
-                    self.ui.status = format!("Cannot record: {e}");
-                    return;
-                }
-            }
+        self.ensure_input();
+        if self.recorder.is_none() {
+            self.ui.status = "Cannot record: no audio input device".into();
+            return;
+        }
+        if let Some(p) = &self.player {
+            p.set_recording(true);
         }
         self.record_start = self.engine.session().edit.selection.start;
         if let Some(r) = &self.recorder {
@@ -306,8 +307,30 @@ impl SoundApp {
         }
     }
 
+    /// Open the input device once (for recording and input monitoring) and feed the player.
+    fn ensure_input(&mut self) {
+        if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
+            return;
+        }
+        match soundcraft_playback::record::Recorder::open() {
+            Ok(r) => {
+                if let Some(p) = &self.player {
+                    p.set_input(std::sync::Arc::clone(&r.monitor));
+                }
+                self.recorder = Some(r);
+            }
+            Err(e) => {
+                self.recorder_failed = true;
+                self.ui.status = format!("No audio input: {e}");
+            }
+        }
+    }
+
     fn finish_recording(&mut self) {
         self.engine.transport.recording = false;
+        if let Some(p) = &self.player {
+            p.set_recording(false);
+        }
         let Some(r) = &self.recorder else { return };
         let take = r.take();
         let rate = take.sample_rate;
@@ -534,6 +557,12 @@ impl SoundApp {
         }
         self.handle_transport(dt);
         self.write_automation(ctx);
+        if self.recorder.is_none()
+            && !self.recorder_failed
+            && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
+        {
+            self.ensure_input();
+        }
         if self.is_playing() || self.meters.values().any(|m| m.level[0] > 0.0001) || !self.pending_shots.is_empty() {
             ctx.request_repaint();
         }

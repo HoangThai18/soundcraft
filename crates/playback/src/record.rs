@@ -21,6 +21,8 @@ struct Shared {
 
 pub struct Recorder {
     shared: Arc<Shared>,
+    /// Live input for monitoring (always fed while the input stream runs).
+    pub monitor: Arc<InputRing>,
     #[cfg(not(target_os = "freebsd"))]
     _stream: Option<cpal::Stream>,
     pub device_name: String,
@@ -48,11 +50,14 @@ impl Recorder {
         let config = cfg.config();
         let shared = Arc::new(Shared { armed: AtomicBool::new(false), data: Mutex::new(Vec::new()) });
         let sh = Arc::clone(&shared);
+        let monitor = InputRing::new(usize::from(config.channels));
+        let mon = Arc::clone(&monitor);
         let mut backlog: Vec<f32> = Vec::new();
         let stream = device
             .build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    mon.push(data);
                     if !sh.armed.load(Ordering::Relaxed) {
                         backlog.clear();
                         return;
@@ -73,6 +78,7 @@ impl Recorder {
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(Recorder {
+            monitor,
             shared,
             _stream: Some(stream),
             device_name: name,
@@ -131,5 +137,50 @@ mod tests {
         assert_eq!(t.channels, vec![vec![1.0, 3.0], vec![2.0, 4.0]]);
         let t = super::deinterleave(&[], 0, 48_000);
         assert_eq!(t.channels.len(), 1);
+    }
+}
+
+/// A small interleaved FIFO from the input callback to the output callback, for input
+/// monitoring. Both sides only `try_lock`; it holds at most ~0.5 s and drops the oldest frames.
+#[derive(Default)]
+pub struct InputRing {
+    data: Mutex<std::collections::VecDeque<f32>>,
+    pub channels: std::sync::atomic::AtomicUsize,
+}
+
+impl InputRing {
+    pub fn new(channels: usize) -> Arc<InputRing> {
+        Arc::new(InputRing {
+            data: Mutex::new(std::collections::VecDeque::with_capacity(48_000 * channels.max(1))),
+            channels: std::sync::atomic::AtomicUsize::new(channels.max(1)),
+        })
+    }
+
+    pub fn push(&self, samples: &[f32]) {
+        if let Ok(mut d) = self.data.try_lock() {
+            let cap = 24_000 * self.channels.load(Ordering::Relaxed).max(1);
+            d.extend(samples.iter().copied());
+            while d.len() > cap {
+                d.pop_front();
+            }
+        }
+    }
+
+    /// Fill `out` (planar) with up to `frames` frames; missing frames are silence.
+    pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize) {
+        let ch = self.channels.load(Ordering::Relaxed).max(1);
+        for c in out.iter_mut() {
+            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
+        let Ok(mut d) = self.data.try_lock() else { return };
+        let avail = (d.len() / ch).min(frames);
+        for f in 0..avail {
+            for c in 0..ch {
+                let v = d.pop_front().unwrap_or(0.0);
+                if let Some(x) = out.get_mut(c).and_then(|o| o.get_mut(f)) {
+                    *x = v;
+                }
+            }
+        }
     }
 }
