@@ -67,9 +67,22 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
 /// Extra catalog mappings handled by the UI layer.
 pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&str, &str)> = UI_COMMANDS.iter().filter(|c| !c.2.is_empty()).map(|c| (c.2, c.0)).collect();
-    for sec in
-        ["Inserts A-E", "Inserts F-J", "Sends A-E", "Sends F-J", "I/O", "Track Color", "Comments", "EQ Curve", "Meters and Faders", "All", "Minimal"]
-    {
+    for sec in [
+        "Inserts A-E",
+        "Inserts F-J",
+        "Sends A-E",
+        "Sends F-J",
+        "I/O",
+        "Track Color",
+        "Comments",
+        "EQ Curve",
+        "Meters and Faders",
+        "All",
+        "Minimal",
+        "Mic Preamps",
+        "Instruments",
+        "Object",
+    ] {
         v.push((Box::leak(format!("View > Mix Window Views > {sec}").into_boxed_str()), "view.mix_section"));
     }
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
@@ -288,6 +301,9 @@ fn mix_section_id(label: &str) -> &'static str {
         "Meters and Faders" => "meters",
         "All" => "all",
         "Minimal" => "minimal",
+        "Mic Preamps" => "mic_preamps",
+        "Instruments" => "instruments",
+        "Object" => "object",
         _ => "",
     }
 }

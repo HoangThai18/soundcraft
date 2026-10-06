@@ -20,6 +20,27 @@ const PRESET_FORMAT: &str = "soundcraft-track-preset";
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
+            "track.object",
+            "Object / Bed",
+            [],
+            None,
+            "{tracks?, object?: bool} — routes the tracks as immersive objects (true) or to the bed; toggles when `object` is omitted",
+            has_selection,
+            |e, p| {
+                let tracks = tracks_required(e, "track.object", p)?;
+                let want = p.get("object").and_then(Value::as_bool);
+                let s = e.session_mut();
+                let mut out = Vec::new();
+                for t in tracks {
+                    let key = format!("object.{}", t.0);
+                    let on = want.unwrap_or(!s.edit.flag(&key));
+                    s.edit.set_flag(&key, on);
+                    out.push(json!({"track": t.0, "object": on}));
+                }
+                Ok(json!({"tracks": out}))
+            }
+        ),
+        cmd!(
             "track.convert_aux_to_folder",
             "Convert Aux to Routing Folder",
             ["Track"],
