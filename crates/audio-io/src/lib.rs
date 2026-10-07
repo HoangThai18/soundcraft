@@ -250,7 +250,7 @@ pub fn decode(bytes: &[u8], ext_hint: Option<&str>) -> Result<(AudioInfo, AudioB
 /// Encode `buf` as WAV/BWF, AIFF/AIFF-C or FLAC. Samples are clamped to [-1, 1].
 pub fn encode(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
     match opts.format {
-        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false),
+        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, None),
         FileFormat::Aiff => aiff::encode(buf, opts.bit_depth, opts.dither),
         FileFormat::Flac => flac::encode(buf, opts.bit_depth, opts.dither),
         other => Err(AudioError::Unsupported(format!("encoding {other:?} is not supported"))),
@@ -259,5 +259,20 @@ pub fn encode(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
 
 /// Encode a WAV file in the RF64 layout regardless of size (normally used only above 4 GiB).
 pub fn encode_wav_rf64(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), true)
+    wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), true, None)
+}
+
+/// Like [`encode`], with an explicit WAV speaker mask (`dwChannelMask`, e.g. 0x60F) for layouts
+/// a channel count alone cannot identify (7.0 vs 6.1, 5.1.4 vs 7.1.2, Ambisonics = 0). AIFF and
+/// FLAC have fixed channel orders and ignore it.
+pub fn encode_with_channel_mask(buf: &AudioBuffer, opts: &EncodeOptions, mask: u32) -> Result<Vec<u8>> {
+    match opts.format {
+        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, Some(mask)),
+        _ => encode(buf, opts),
+    }
+}
+
+/// The WAVE_FORMAT_EXTENSIBLE speaker mask of a WAV file, if it has one.
+pub fn wav_channel_mask(bytes: &[u8]) -> Option<u32> {
+    wav::read_channel_mask(bytes)
 }

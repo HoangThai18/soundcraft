@@ -248,3 +248,23 @@ fn serde_types_roundtrip() {
     let s = serde_json::to_string(&info).unwrap();
     assert_eq!(serde_json::from_str::<soundcraft_audio_io::AudioInfo>(&s).unwrap(), info);
 }
+
+#[test]
+fn multichannel_wav_speaker_masks() {
+    let buf = |n: usize| AudioBuffer { sample_rate: 48_000, channels: (0..n).map(|c| vec![0.01 * c as f32; 64]).collect() };
+    let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None };
+    for (n, mask) in [(6usize, 0x3Fu32), (8, 0x63F), (12, 0x2_D63F)] {
+        let bytes = soundcraft_audio_io::encode(&buf(n), &opts).unwrap();
+        assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), Some(mask), "{n} channels");
+        assert_eq!(soundcraft_audio_io::decode(&bytes, Some("wav")).unwrap().1.channels.len(), n);
+    }
+    // Explicit masks: 7.0 (sides + rears, no LFE) and Ambisonics (no positions).
+    let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf(7), &opts, 0x637).unwrap();
+    assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), Some(0x637));
+    let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf(4), &opts, 0).unwrap();
+    assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), Some(0));
+    // Plain 16-bit stereo stays a plain PCM header.
+    let o16 = EncodeOptions { bit_depth: BitDepth::Int16, ..opts };
+    let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf(2), &o16, 0x3).unwrap();
+    assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), None);
+}

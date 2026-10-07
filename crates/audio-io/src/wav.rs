@@ -190,6 +190,8 @@ pub(crate) fn decode(b: &[u8], layout: &WavLayout) -> Result<AudioBuffer> {
     Ok(AudioBuffer { sample_rate: layout.info.sample_rate, channels })
 }
 
+/// Default speaker mask for a channel count (callers that know the layout pass their own):
+/// mono, stereo, LCR, quad, 5.0, 5.1, 6.1, 7.1 (sides + rears), 7.1.4.
 fn channel_mask(channels: usize) -> u32 {
     match channels {
         1 => 0x4,
@@ -200,9 +202,27 @@ fn channel_mask(channels: usize) -> u32 {
         6 => 0x3F,
         7 => 0x13F,
         8 => 0x63F,
+        // L R C LFE Lrs Rrs Lss Rss Ltf Rtf Ltr Rtr (7.1.4).
+        12 => 0x2_D63F,
         n if n <= 18 => (1u32 << n) - 1,
         _ => 0,
     }
+}
+
+/// The `dwChannelMask` of a WAVE_FORMAT_EXTENSIBLE file (None for plain PCM/float headers).
+pub(crate) fn read_channel_mask(b: &[u8]) -> Option<u32> {
+    if !is_wav(b) {
+        return None;
+    }
+    let mut pos = 12usize;
+    for _ in 0..10_000 {
+        let (id, size) = (tag(b, pos)?, usize::try_from(le_u32(b, pos + 4)?).ok()?);
+        if &id == b"fmt " {
+            return (le_u16(b, pos + 8)? == WAVE_FORMAT_EXTENSIBLE).then(|| le_u32(b, pos + 8 + 20)).flatten();
+        }
+        pos = pos.checked_add(8)?.checked_add(size)?.checked_add(size & 1)?;
+    }
+    None
 }
 
 fn put_fixed_str(out: &mut Vec<u8>, s: &str, len: usize) {
@@ -237,7 +257,15 @@ fn push_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
 
 /// Encode a WAV file. `force_rf64` writes the RF64 layout even for small files (for tests);
 /// it is used automatically when the file would exceed 4 GiB.
-pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, bwf: Option<&BwfInfo>, force_rf64: bool) -> Result<Vec<u8>> {
+/// `mask` overrides the speaker mask derived from the channel count.
+pub(crate) fn encode(
+    buf: &AudioBuffer,
+    depth: BitDepth,
+    dither: bool,
+    bwf: Option<&BwfInfo>,
+    force_rf64: bool,
+    mask: Option<u32>,
+) -> Result<Vec<u8>> {
     validate_buffer(buf)?;
     let channels = buf.channels.len();
     let frames = buf.frames();
@@ -251,7 +279,7 @@ pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, bwf: Opti
     let block = bytes.checked_mul(channels).ok_or_else(|| AudioError::TooLarge("block size overflow".into()))?;
     let block_align = u16::try_from(block).map_err(|_| AudioError::Encode("too many channels for WAV".into()))?;
     let data_len = block.checked_mul(frames).ok_or_else(|| AudioError::TooLarge("data size overflow".into()))?;
-    let extensible = channels > 2 || bits > 16;
+    let extensible = channels > 2 || bits > 16 || mask.is_some_and(|m| m != channel_mask(channels));
     let fmt_tag = if is_float { WAVE_FORMAT_IEEE_FLOAT } else { WAVE_FORMAT_PCM };
 
     let mut fmt = Vec::with_capacity(40);
@@ -264,7 +292,7 @@ pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, bwf: Opti
     if extensible {
         fmt.extend_from_slice(&22u16.to_le_bytes());
         fmt.extend_from_slice(&bits.to_le_bytes());
-        fmt.extend_from_slice(&channel_mask(channels).to_le_bytes());
+        fmt.extend_from_slice(&mask.unwrap_or_else(|| channel_mask(channels)).to_le_bytes());
         fmt.extend_from_slice(&fmt_tag.to_le_bytes());
         fmt.extend_from_slice(&GUID_TAIL);
     }

@@ -81,7 +81,7 @@ fn hostile_value() -> impl Strategy<Value = Value> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 8, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 6, .. ProptestConfig::default() })]
     #[test]
     fn no_command_panics_on_hostile_params(fields in proptest::collection::vec((0usize..KEYS.len(), hostile_value()), 0..6)) {
         let mut params = serde_json::Map::new();

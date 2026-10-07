@@ -143,6 +143,74 @@ impl ChannelFormat {
     pub fn from_id(s: &str) -> Option<ChannelFormat> {
         ChannelFormat::ALL.into_iter().find(|f| f.label().eq_ignore_ascii_case(s.trim()))
     }
+    /// Speakers in channel order, or empty for Ambisonics (ACN order, SN3D).
+    ///
+    /// Channel order is SMPTE / WAV order: speakers with a WAVE_FORMAT_EXTENSIBLE mask bit come in
+    /// ascending bit order (L R C LFE Ls Rs Lc Rc Cs Lss Rss Ltf Rtf Ltr Rtr; 7.x puts the rear
+    /// surrounds Lrs/Rrs on the "back" bits before the sides Lss/Rss), followed by speakers WAV
+    /// cannot name (the top-middle pair of .6 layouts). E.g. 5.1 = L R C LFE Ls Rs,
+    /// 7.1 = L R C LFE Lrs Rrs Lss Rss, 7.1.4 = L R C LFE Lrs Rrs Lss Rss Ltf Rtf Ltr Rtr.
+    pub fn speakers(self) -> &'static [Speaker] {
+        use Speaker::*;
+        match self {
+            ChannelFormat::Mono => &[C],
+            ChannelFormat::Stereo => &[L, R],
+            ChannelFormat::Lcr => &[L, R, C],
+            ChannelFormat::Quad => &[L, R, Ls, Rs],
+            ChannelFormat::Lcrs => &[L, R, C, Cs],
+            ChannelFormat::Surround50 => &[L, R, C, Ls, Rs],
+            ChannelFormat::Surround51 => &[L, R, C, Lfe, Ls, Rs],
+            ChannelFormat::Surround60 => &[L, R, C, Ls, Rs, Cs],
+            ChannelFormat::Surround61 => &[L, R, C, Lfe, Ls, Rs, Cs],
+            ChannelFormat::Sdds70 => &[L, R, C, Ls, Rs, Lc, Rc],
+            ChannelFormat::Sdds71 => &[L, R, C, Lfe, Ls, Rs, Lc, Rc],
+            ChannelFormat::Surround70 => &[L, R, C, Lrs, Rrs, Lss, Rss],
+            ChannelFormat::Surround71 => &[L, R, C, Lfe, Lrs, Rrs, Lss, Rss],
+            ChannelFormat::Atmos702 => &[L, R, C, Lrs, Rrs, Lss, Rss, Ltm, Rtm],
+            ChannelFormat::Atmos712 => &[L, R, C, Lfe, Lrs, Rrs, Lss, Rss, Ltm, Rtm],
+            ChannelFormat::Atmos502 => &[L, R, C, Ls, Rs, Ltm, Rtm],
+            ChannelFormat::Atmos512 => &[L, R, C, Lfe, Ls, Rs, Ltm, Rtm],
+            ChannelFormat::Atmos504 => &[L, R, C, Ls, Rs, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos514 => &[L, R, C, Lfe, Ls, Rs, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos704 => &[L, R, C, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos714 => &[L, R, C, Lfe, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos706 => &[L, R, C, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltr, Rtr, Ltm, Rtm],
+            ChannelFormat::Atmos716 => &[L, R, C, Lfe, Lrs, Rrs, Lss, Rss, Ltf, Rtf, Ltr, Rtr, Ltm, Rtm],
+            ChannelFormat::Atmos904 => &[L, R, C, Lrs, Rrs, Lw, Rw, Lss, Rss, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos914 => &[L, R, C, Lfe, Lrs, Rrs, Lw, Rw, Lss, Rss, Ltf, Rtf, Ltr, Rtr],
+            ChannelFormat::Atmos906 => &[L, R, C, Lrs, Rrs, Lw, Rw, Lss, Rss, Ltf, Rtf, Ltr, Rtr, Ltm, Rtm],
+            ChannelFormat::Atmos916 => &[L, R, C, Lfe, Lrs, Rrs, Lw, Rw, Lss, Rss, Ltf, Rtf, Ltr, Rtr, Ltm, Rtm],
+            ChannelFormat::Ambisonics(_) => &[],
+        }
+    }
+    pub fn is_ambisonic(self) -> bool {
+        matches!(self, ChannelFormat::Ambisonics(_))
+    }
+    pub fn has_lfe(self) -> bool {
+        self.speakers().contains(&Speaker::Lfe)
+    }
+    pub fn has_height(self) -> bool {
+        self.speakers().iter().any(|s| s.is_height())
+    }
+    /// Short per-channel labels for meters (`W Y Z X 5…` for Ambisonics).
+    pub fn channel_label(self, ch: usize) -> String {
+        match self.speakers().get(ch) {
+            Some(s) => s.label().to_string(),
+            None if self.is_ambisonic() => ["W", "Y", "Z", "X"].get(ch).map_or_else(|| format!("{}", ch + 1), |s| s.to_string()),
+            None => format!("{}", ch + 1),
+        }
+    }
+    /// WAVE_FORMAT_EXTENSIBLE channel mask (0 = no positions, e.g. Ambisonics). Speakers that WAV
+    /// cannot name (top middle) borrow the top-front bits when the layout has no top fronts.
+    pub fn channel_mask(self) -> u32 {
+        let sp = self.speakers();
+        let has_tf = sp.contains(&Speaker::Ltf);
+        sp.iter().fold(0u32, |m, s| match s {
+            Speaker::Ltm if !has_tf => m | 0x1000,
+            Speaker::Rtm if !has_tf => m | 0x4000,
+            s => m | s.wave_bit(),
+        })
+    }
     /// Best format for a channel count.
     pub fn for_channels(n: usize) -> ChannelFormat {
         [
@@ -158,6 +226,168 @@ impl ChannelFormat {
         .into_iter()
         .find(|f| f.channels() == n)
         .unwrap_or(if n <= 1 { ChannelFormat::Mono } else { ChannelFormat::Stereo })
+    }
+}
+
+/// A loudspeaker position in a channel format.
+///
+/// Angles follow ITU-R BS.775 / Dolby conventions: azimuth in degrees, 0 = front centre, positive
+/// = to the right; elevation in degrees above the listener plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Speaker {
+    L,
+    R,
+    C,
+    Lfe,
+    /// 5.x surrounds (±110°).
+    Ls,
+    Rs,
+    /// SDDS inner fronts (±15°).
+    Lc,
+    Rc,
+    /// Centre surround (180°).
+    Cs,
+    /// 7.x side surrounds (±90°).
+    Lss,
+    Rss,
+    /// 7.x rear surrounds (±150°).
+    Lrs,
+    Rrs,
+    /// 9.x front wides (±60°).
+    Lw,
+    Rw,
+    /// Top front (±45°, elevation 45°).
+    Ltf,
+    Rtf,
+    /// Top middle (±90°, elevation 45°).
+    Ltm,
+    Rtm,
+    /// Top rear (±135°, elevation 45°).
+    Ltr,
+    Rtr,
+}
+
+impl Speaker {
+    pub fn azimuth(self) -> f32 {
+        match self {
+            Speaker::L => -30.0,
+            Speaker::R => 30.0,
+            Speaker::C | Speaker::Lfe => 0.0,
+            Speaker::Ls => -110.0,
+            Speaker::Rs => 110.0,
+            Speaker::Lc => -15.0,
+            Speaker::Rc => 15.0,
+            Speaker::Cs => 180.0,
+            Speaker::Lss => -90.0,
+            Speaker::Rss => 90.0,
+            Speaker::Lrs => -150.0,
+            Speaker::Rrs => 150.0,
+            Speaker::Lw => -60.0,
+            Speaker::Rw => 60.0,
+            Speaker::Ltf => -45.0,
+            Speaker::Rtf => 45.0,
+            Speaker::Ltm => -90.0,
+            Speaker::Rtm => 90.0,
+            Speaker::Ltr => -135.0,
+            Speaker::Rtr => 135.0,
+        }
+    }
+    pub fn elevation(self) -> f32 {
+        if self.is_height() { 45.0 } else { 0.0 }
+    }
+    pub fn is_height(self) -> bool {
+        matches!(self, Speaker::Ltf | Speaker::Rtf | Speaker::Ltm | Speaker::Rtm | Speaker::Ltr | Speaker::Rtr)
+    }
+    pub fn is_lfe(self) -> bool {
+        self == Speaker::Lfe
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Speaker::L => "L",
+            Speaker::R => "R",
+            Speaker::C => "C",
+            Speaker::Lfe => "LFE",
+            Speaker::Ls => "Ls",
+            Speaker::Rs => "Rs",
+            Speaker::Lc => "Lc",
+            Speaker::Rc => "Rc",
+            Speaker::Cs => "Cs",
+            Speaker::Lss => "Lss",
+            Speaker::Rss => "Rss",
+            Speaker::Lrs => "Lrs",
+            Speaker::Rrs => "Rrs",
+            Speaker::Lw => "Lw",
+            Speaker::Rw => "Rw",
+            Speaker::Ltf => "Ltf",
+            Speaker::Rtf => "Rtf",
+            Speaker::Ltm => "Ltm",
+            Speaker::Rtm => "Rtm",
+            Speaker::Ltr => "Ltr",
+            Speaker::Rtr => "Rtr",
+        }
+    }
+    /// WAVE_FORMAT_EXTENSIBLE `dwChannelMask` bit (0 for speakers WAV cannot name).
+    pub fn wave_bit(self) -> u32 {
+        match self {
+            Speaker::L => 0x1,
+            Speaker::R => 0x2,
+            Speaker::C => 0x4,
+            Speaker::Lfe => 0x8,
+            Speaker::Ls | Speaker::Lrs => 0x10,
+            Speaker::Rs | Speaker::Rrs => 0x20,
+            Speaker::Lc | Speaker::Lw => 0x40,
+            Speaker::Rc | Speaker::Rw => 0x80,
+            Speaker::Cs => 0x100,
+            Speaker::Lss => 0x200,
+            Speaker::Rss => 0x400,
+            Speaker::Ltf => 0x1000,
+            Speaker::Rtf => 0x4000,
+            Speaker::Ltr => 0x8000,
+            Speaker::Rtr => 0x2_0000,
+            Speaker::Ltm | Speaker::Rtm => 0,
+        }
+    }
+}
+
+/// Surround panner position (Pro Tools-style X/Y puck). `None` on a mixer means "use the stereo
+/// pan", which keeps sessions made before surround mixing sounding exactly as they did.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SurroundPan {
+    /// -1 (left) ..= 1 (right).
+    pub x: f32,
+    /// -1 (back) ..= 1 (front).
+    pub y: f32,
+    /// Elevation 0 (ear level) ..= 1 (overhead), used by height formats.
+    pub z: f32,
+    /// 0 = point source ..= 1 = spread over every speaker.
+    pub divergence: f32,
+    /// Centre speaker share of front-centre images, 0..=100 % (0 = phantom centre on L/R).
+    pub center: f32,
+    /// LFE send level, dB (-144 = off).
+    pub lfe_db: f32,
+}
+
+impl Default for SurroundPan {
+    fn default() -> Self {
+        SurroundPan { x: 0.0, y: 1.0, z: 0.0, divergence: 0.0, center: 100.0, lfe_db: -144.0 }
+    }
+}
+
+impl SurroundPan {
+    /// Puck at the stereo pan position (front edge).
+    pub fn from_stereo(pan: f32) -> Self {
+        SurroundPan { x: finite_or(pan, 0.0).clamp(-1.0, 1.0), ..SurroundPan::default() }
+    }
+    /// Clamp into range (NaN → defaults).
+    pub fn sanitize(&mut self) {
+        let d = SurroundPan::default();
+        self.x = finite_or(self.x, d.x).clamp(-1.0, 1.0);
+        self.y = finite_or(self.y, d.y).clamp(-1.0, 1.0);
+        self.z = finite_or(self.z, d.z).clamp(0.0, 1.0);
+        self.divergence = finite_or(self.divergence, d.divergence).clamp(0.0, 1.0);
+        self.center = finite_or(self.center, d.center).clamp(0.0, 100.0);
+        self.lfe_db = finite_or(self.lfe_db, d.lfe_db).clamp(-144.0, 12.0);
     }
 }
 
@@ -226,11 +456,14 @@ pub struct SendSlot {
     pub pre_fader: bool,
     #[serde(default = "yes")]
     pub follow_main_pan: bool,
+    /// Surround position into a multichannel bus (None = follow the track / stereo pan).
+    #[serde(default)]
+    pub surround: Option<SurroundPan>,
 }
 
 impl SendSlot {
     pub fn new(target: Route) -> Self {
-        SendSlot { target, level_db: -144.0, pan: 0.0, mute: false, pre_fader: false, follow_main_pan: true }
+        SendSlot { target, level_db: -144.0, pan: 0.0, mute: false, pre_fader: false, follow_main_pan: true, surround: None }
     }
 }
 
@@ -261,6 +494,9 @@ pub struct Mixer {
     /// VCA master that controls this track, if any (track id of the VCA).
     #[serde(default)]
     pub vca: Option<u64>,
+    /// Surround panner, used when the output is multichannel (None = the stereo pan to L/R).
+    #[serde(default)]
+    pub surround: Option<SurroundPan>,
 }
 
 impl Mixer {
@@ -286,6 +522,7 @@ impl Mixer {
             automation_mode: AutomationMode::Read,
             trim_db: 0.0,
             vca: None,
+            surround: None,
         }
     }
 
@@ -300,8 +537,25 @@ impl Mixer {
         for s in self.sends.iter_mut().flatten() {
             s.level_db = finite_or(s.level_db, -144.0).clamp(-144.0, 12.0);
             s.pan = finite_or(s.pan, 0.0).clamp(-1.0, 1.0);
+            if let Some(sp) = &mut s.surround {
+                sp.sanitize();
+            }
+        }
+        if let Some(sp) = &mut self.surround {
+            sp.sanitize();
         }
         self.trim_db = finite_or(self.trim_db, 0.0).clamp(-144.0, 24.0);
+    }
+}
+
+impl crate::Session {
+    /// The main mix format: the format of the first (main) output path, at least stereo and at
+    /// most 16 channels (wider formats fall back to stereo).
+    pub fn main_format(&self) -> ChannelFormat {
+        match self.outputs.first().map(|o| o.format) {
+            Some(f) if (2..=16).contains(&f.channels()) => f,
+            _ => ChannelFormat::Stereo,
+        }
     }
 }
 
@@ -355,6 +609,37 @@ mod tests {
         m.sanitize();
         assert_eq!(m.volume_db, 0.0);
         assert_eq!(m.inserts.len(), INSERT_SLOTS);
+    }
+
+    #[test]
+    fn speaker_layouts_match_channel_counts_and_masks() {
+        for f in ChannelFormat::ALL {
+            if !f.is_ambisonic() {
+                assert_eq!(f.speakers().len(), f.channels(), "{f:?}");
+                // Mask bits are unique and in ascending channel order.
+                let bits: Vec<u32> = f.speakers().iter().map(|s| s.wave_bit()).filter(|b| *b != 0).collect();
+                assert!(bits.windows(2).all(|w| w[0] < w[1]), "{f:?} not in WAV order");
+            }
+        }
+        assert_eq!(ChannelFormat::Surround51.channel_mask(), 0x3F);
+        assert_eq!(ChannelFormat::Surround71.channel_mask(), 0x63F);
+        assert_eq!(ChannelFormat::Atmos714.channel_mask(), 0x2_D63F);
+        assert_eq!(ChannelFormat::Ambisonics(1).channel_mask(), 0);
+    }
+
+    #[test]
+    fn surround_pan_defaults_and_old_sessions() {
+        let m = Mixer::new(ChannelFormat::Mono);
+        assert_eq!(m.surround, None);
+        // A mixer saved before surround existed still loads.
+        let mut v = serde_json::to_value(&m).unwrap();
+        v.as_object_mut().unwrap().remove("surround");
+        let back: Mixer = serde_json::from_value(v).unwrap();
+        assert_eq!(back.surround, None);
+        let mut sp: SurroundPan = serde_json::from_str(r#"{"x": 5.0}"#).unwrap();
+        sp.sanitize();
+        assert_eq!(sp.x, 1.0);
+        assert_eq!(sp.center, 100.0);
     }
 
     #[test]

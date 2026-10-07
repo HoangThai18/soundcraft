@@ -1,31 +1,85 @@
 //! The SoundCraft mix engine.
 //!
-//! [`MixEngine::render`] produces one block of the main stereo output for a session at a timeline
+//! [`MixEngine::render`] produces one block of the main output for a session at a timeline
 //! position: clips (with clip gain and fades) → trim/phase → inserts → pre-fader sends → fader and
 //! mute (with automation) → pan → post-fader sends → busses → aux inputs → main → master faders.
 //! The same code drives realtime playback and offline bounces, so what you hear is what you get.
 //! Steady-state rendering does not allocate.
+//!
+//! ## Surround
+//! The main mix has the format of the session's main output path ([`Session::main_format`]:
+//! stereo by default, up to 16 channels such as 7.1.4 or 9.1.6) and every bus has its own format.
+//! Channels are in SMPTE / WAV order (L R C LFE Ls Rs …, see
+//! [`ChannelFormat::speakers`](soundcraft_model::ChannelFormat::speakers)). Routing a strip into a
+//! destination builds a gain matrix per block:
+//! - mono/stereo sources into a stereo destination use the stereo pan exactly as before;
+//! - into a multichannel destination they use the track's [`SurroundPan`] (pairwise
+//!   constant-power panner over the speaker layout, see `soundcraft_dsp::pan::surround_gains`),
+//!   or go to L/R with the stereo pan when the track has no surround pan;
+//! - sources whose format equals the destination's pass straight through, channel for channel;
+//! - other multichannel sources fold to stereo with ITU-R BS.775 coefficients (C and surrounds at
+//!   -3 dB, LFE dropped), or map speaker by speaker into other multichannel layouts.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use soundcraft_dsp::pan::{PanLaw, gains};
+use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, db_to_gain};
-use soundcraft_model::{AutoParam, BusId, Clip, ClipContent, Route, Session, Track, TrackId, TrackKind};
+use soundcraft_model::{AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, Speaker, SurroundPan, Track, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
 
-/// Main mix width.
+/// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
 
+/// Widest strip, bus or main mix (9.1.6 / 3rd-order Ambisonics). Wider formats are truncated.
+pub const MAX_CHANNELS: usize = 16;
+
+/// Number of channels of a session's main mix.
+pub fn main_channels(s: &Session) -> usize {
+    s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
+}
+
 /// Peak meter values for one strip (linear, per channel, max over the last block).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StripMeter {
+    /// First two channels (mono strips repeat channel 0), for stereo meters.
     pub peak: [f32; 2],
+    /// Every channel of the strip (or of the main mix).
+    pub peaks: Vec<f32>,
     /// Gain reduction of the first dynamics insert, dB.
     pub gain_reduction_db: f32,
 }
 
+impl StripMeter {
+    /// Copy another meter without reallocating once the channel count is stable.
+    pub fn copy_from(&mut self, o: &StripMeter) {
+        self.peak = o.peak;
+        self.peaks.clone_from(&o.peaks);
+        self.gain_reduction_db = o.gain_reduction_db;
+    }
+
+    fn measure(&mut self, bufs: &[Vec<f32>], frames: usize, gr: f32) {
+        if self.peaks.len() != bufs.len() {
+            self.peaks.resize(bufs.len(), 0.0);
+        }
+        for (p, b) in self.peaks.iter_mut().zip(bufs.iter()) {
+            *p = peak(b.get(..frames).unwrap_or(&[]));
+        }
+        let last = self.peaks.len().saturating_sub(1);
+        self.peak = [self.peaks.first().copied().unwrap_or(0.0), self.peaks.get(1.min(last)).copied().unwrap_or(0.0)];
+        self.gain_reduction_db = gr;
+    }
+}
+
+/// A bus: its format and one buffer per channel.
+struct BusBuf {
+    fmt: ChannelFormat,
+    buf: Vec<Vec<f32>>,
+}
+
 struct PluginSlot {
     id: String,
+    /// Channel count the plugin was prepared for.
+    ch: usize,
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
@@ -131,8 +185,9 @@ pub struct MixEngine {
     sample_rate: f32,
     max_block: usize,
     strips: HashMap<TrackId, Strip>,
-    busses: HashMap<BusId, Vec<Vec<f32>>>,
+    busses: HashMap<BusId, BusBuf>,
     main: Vec<Vec<f32>>,
+    main_fmt: ChannelFormat,
     pub meters: HashMap<TrackId, StripMeter>,
     pub main_meter: StripMeter,
     pub pan_law: PanLaw,
@@ -160,6 +215,7 @@ impl MixEngine {
             strips: HashMap::new(),
             busses: HashMap::new(),
             main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
+            main_fmt: ChannelFormat::Stereo,
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
@@ -175,6 +231,16 @@ impl MixEngine {
 
     pub fn max_block(&self) -> usize {
         self.max_block
+    }
+
+    /// Format of the main mix as of the last sync.
+    pub fn main_format(&self) -> ChannelFormat {
+        self.main_fmt
+    }
+
+    /// Channels of the main mix as of the last sync.
+    pub fn main_channels(&self) -> usize {
+        self.main.len()
     }
 
     /// Reset all plugin state (on stop / seek).
@@ -198,9 +264,14 @@ impl MixEngine {
     pub fn sync(&mut self, s: &Session) {
         let sr = self.sample_rate;
         let mb = self.max_block;
+        let main_ch = main_channels(s);
+        self.main_fmt = s.main_format();
+        if self.main.len() != main_ch {
+            self.main = vec![vec![0.0; mb]; main_ch];
+        }
         self.strips.retain(|id, _| s.track(*id).is_some());
         for t in &s.tracks {
-            let ch = strip_channels(t);
+            let ch = strip_channels(t, main_ch);
             let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
@@ -208,10 +279,10 @@ impl MixEngine {
             strip.plugins.resize_with(t.mixer.inserts.len(), || None);
             for (slot, ins) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()) {
                 match ins {
-                    Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin) => {
+                    Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch) => {
                         *slot = create_plugin(&i.plugin).map(|mut p| {
                             p.prepare(sr, mb, ch);
-                            PluginSlot { id: i.plugin.clone(), plugin: p, applied: Vec::new() }
+                            PluginSlot { id: i.plugin.clone(), ch, plugin: p, applied: Vec::new() }
                         });
                     }
                     None => *slot = None,
@@ -223,13 +294,18 @@ impl MixEngine {
                 strip.instrument = want.and_then(|id| {
                     create_plugin(id).map(|mut p| {
                         p.prepare(sr, mb, ch.max(2));
-                        PluginSlot { id: id.to_string(), plugin: p, applied: Vec::new() }
+                        PluginSlot { id: id.to_string(), ch: ch.max(2), plugin: p, applied: Vec::new() }
                     })
                 });
             }
         }
         for b in &s.busses {
-            self.busses.entry(b.id).or_insert_with(|| vec![vec![0.0; mb]; MAIN_CHANNELS]);
+            let n = b.format.channels().clamp(1, MAX_CHANNELS);
+            let bus = self.busses.entry(b.id).or_insert_with(|| BusBuf { fmt: b.format, buf: Vec::new() });
+            bus.fmt = b.format;
+            if bus.buf.len() != n {
+                bus.buf = vec![vec![0.0; mb]; n];
+            }
         }
         self.busses.retain(|id, _| s.bus(*id).is_some());
     }
@@ -255,7 +331,7 @@ impl MixEngine {
             self.synced = key;
         }
         for b in self.busses.values_mut() {
-            for c in b.iter_mut() {
+            for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
             }
         }
@@ -342,7 +418,7 @@ impl MixEngine {
                 }
                 let v0 = volume_db_at(t, pos);
                 let v1 = volume_db_at(t, pos + frames as i64);
-                for (ch, src) in strip.buf.iter().enumerate().take(MAIN_CHANNELS) {
+                for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
                     if let Some(m) = self.main.get_mut(ch) {
                         for i in 0..frames {
                             let g = lerp_gain(v0, v1, i, frames);
@@ -352,47 +428,47 @@ impl MixEngine {
                         }
                     }
                 }
-                let mut pk = [0.0f32; 2];
-                for (c, p) in pk.iter_mut().enumerate() {
-                    *p = self.main.get(c).map_or(0.0, |m| peak(m.get(..frames).unwrap_or(&[])));
-                }
-                self.meters.insert(t.id, StripMeter { peak: pk, gain_reduction_db: 0.0 });
+                self.meters.entry(t.id).or_default().measure(&self.main, frames, 0.0);
             }
         }
-        let mut pk = [0.0f32; 2];
+        // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {
-            let src = self.main.get(c.min(MAIN_CHANNELS - 1));
+            let src = self.main.get(c);
             for i in 0..frames {
                 let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0);
                 if let Some(d) = o.get_mut(i) {
                     *d = if v.is_finite() { v } else { 0.0 };
                 }
             }
-            if let Some(p) = pk.get_mut(c) {
-                *p = peak(o.get(..frames).unwrap_or(&[]));
-            }
         }
-        self.main_meter = StripMeter { peak: pk, gain_reduction_db: 0.0 };
+        self.main_meter.measure(&self.main, frames, 0.0);
     }
 
     /// Send, meter and pan a processed strip into the busses / main mix.
     fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
-        let mut pk = [0.0f32; 2];
-        for (c, p) in pk.iter_mut().enumerate() {
-            let ch = c.min(strip.buf.len().saturating_sub(1));
-            *p = strip.buf.get(ch).map_or(0.0, |b| peak(b.get(..frames).unwrap_or(&[])));
-        }
-        self.meters.insert(t.id, StripMeter { peak: pk, gain_reduction_db: strip.gr });
+        self.meters.entry(t.id).or_default().measure(&strip.buf, frames, strip.gr);
+        let src_fmt = strip_format(t, strip.buf.len());
+        let law = self.pan_law;
         for (i, snd) in t.mixer.sends.iter().enumerate() {
             let Some(snd) = snd else { continue };
             if snd.mute || strip.muted {
                 continue;
             }
             let lvl = send_level(t, i, snd.level_db, pos);
+            let gain = db_to_gain(lvl);
             let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
-            mix_to_bus(src, frames, &mut self.busses, &snd.target, db_to_gain(lvl), snd.pan, self.pan_law, &t.mixer.pan);
+            let Route::Bus(b) = &snd.target else { continue };
+            let Some(dst) = self.busses.get_mut(b) else { continue };
+            if gain <= 0.0 {
+                continue;
+            }
+            // Mono sends use the send's own pan; stereo sends go straight to L/R.
+            let stereo = if src.len() == 1 { [snd.pan, 0.0] } else { [-1.0, 1.0] };
+            let surround = snd.surround.as_ref().or(if snd.follow_main_pan { t.mixer.surround.as_ref() } else { None });
+            let m = build_matrix(src_fmt, src.len(), dst.fmt, dst.buf.len(), &PanSpec { stereo, surround }, law);
+            apply_matrix(src, frames, &mut dst.buf, &m, gain);
         }
-        let pans: [f32; 2] = [pan_at(t, 0, pos), pan_at(t, 1, pos)];
+        let spec = PanSpec { stereo: [pan_at(t, 0, pos), pan_at(t, 1, pos)], surround: t.mixer.surround.as_ref() };
         match &t.mixer.output {
             Route::Main if strip.out_extra.len > 0 => {
                 if strip.outbuf.len() != strip.buf.len() {
@@ -403,12 +479,17 @@ impl MixEngine {
                     d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
                 }
                 strip.out_extra.process(&mut strip.outbuf, frames);
-                pan_into(&strip.outbuf, frames, &mut self.main, &pans, self.pan_law);
+                let m = build_matrix(src_fmt, strip.outbuf.len(), self.main_fmt, self.main.len(), &spec, law);
+                apply_matrix(&strip.outbuf, frames, &mut self.main, &m, 1.0);
             }
-            Route::Main => pan_into(&strip.buf, frames, &mut self.main, &pans, self.pan_law),
+            Route::Main => {
+                let m = build_matrix(src_fmt, strip.buf.len(), self.main_fmt, self.main.len(), &spec, law);
+                apply_matrix(&strip.buf, frames, &mut self.main, &m, 1.0);
+            }
             Route::Bus(b) => {
                 if let Some(dst) = self.busses.get_mut(b) {
-                    pan_into(&strip.buf, frames, dst, &pans, self.pan_law);
+                    let m = build_matrix(src_fmt, strip.buf.len(), dst.fmt, dst.buf.len(), &spec, law);
+                    apply_matrix(&strip.buf, frames, &mut dst.buf, &m, 1.0);
                 }
             }
             _ => {}
@@ -429,7 +510,7 @@ fn process_strip(
     s: &Session,
     t: &Track,
     strip: &mut Strip,
-    busses: &HashMap<BusId, Vec<Vec<f32>>>,
+    busses: &HashMap<BusId, BusBuf>,
     live: &LiveInput<'_>,
     pos: Samples,
     frames: usize,
@@ -491,20 +572,21 @@ fn process_strip(
             if let Route::Bus(b) = &t.mixer.input
                 && let Some(src) = busses.get(b)
             {
-                let nch = strip.buf.len();
-                for (ch, dst) in strip.buf.iter_mut().enumerate() {
-                    for i in 0..frames {
-                        let v = if nch == 1 {
-                            0.5 * (src.first().and_then(|c| c.get(i)).copied().unwrap_or(0.0)
-                                + src.get(1).and_then(|c| c.get(i)).copied().unwrap_or(0.0))
-                        } else {
-                            src.get(ch.min(1)).and_then(|c| c.get(i)).copied().unwrap_or(0.0)
-                        };
-                        if let Some(d) = dst.get_mut(i) {
-                            *d = v;
-                        }
-                    }
-                }
+                let (ns, nd) = (src.buf.len(), strip.buf.len());
+                let dst_fmt = strip_format(t, nd);
+                let m = if src.fmt == dst_fmt && ns == nd {
+                    identity_matrix(ns)
+                } else if ns == 1 && nd == 2 {
+                    // A mono bus feeds both sides of a stereo aux.
+                    let mut m = [[0.0; MAX_CHANNELS]; MAX_CHANNELS];
+                    m[0][0] = 1.0;
+                    m[0][1] = 1.0;
+                    m
+                } else {
+                    let stereo = if ns == 1 { [0.0, 0.0] } else { [-1.0, 1.0] };
+                    build_matrix(src.fmt, ns, dst_fmt, nd, &PanSpec { stereo, surround: None }, PanLaw::Minus3)
+                };
+                apply_matrix(&src.buf, frames, &mut strip.buf, &m, 1.0);
             }
         }
         TrackKind::Instrument | TrackKind::Midi => {
@@ -675,6 +757,7 @@ fn structure_fingerprint(s: &Session) -> usize {
         t.kind.hash(&mut h);
         t.format.hash(&mut h);
         t.inactive.hash(&mut h);
+        t.mixer.inserts.len().hash(&mut h);
         t.mixer.input.hash(&mut h);
         t.mixer.output.hash(&mut h);
         for i in &t.mixer.inserts {
@@ -687,7 +770,9 @@ fn structure_fingerprint(s: &Session) -> usize {
     }
     for b in &s.busses {
         b.id.hash(&mut h);
+        b.format.hash(&mut h);
     }
+    s.main_format().hash(&mut h);
     h.finish() as usize
 }
 
@@ -707,12 +792,17 @@ fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     work.iter_mut().for_each(f);
 }
 
-fn strip_channels(t: &Track) -> usize {
+fn strip_channels(t: &Track, main_ch: usize) -> usize {
     match t.kind {
-        TrackKind::Master => MAIN_CHANNELS,
-        TrackKind::Instrument => t.channels().max(2),
-        _ => t.channels().clamp(1, 16),
+        TrackKind::Master => main_ch,
+        TrackKind::Instrument => t.channels().clamp(2, MAX_CHANNELS),
+        _ => t.channels().clamp(1, MAX_CHANNELS),
     }
+}
+
+/// The format a strip's buffer actually carries (a mono instrument renders in stereo).
+fn strip_format(t: &Track, n: usize) -> ChannelFormat {
+    if t.format.channels().min(MAX_CHANNELS) == n { t.format } else { ChannelFormat::for_channels(n) }
 }
 
 /// Audio/instrument tracks first, then auxes ordered so bus producers come before consumers.
@@ -921,103 +1011,285 @@ fn peak(x: &[f32]) -> f32 {
     x.iter().fold(0.0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m })
 }
 
-/// Pan a strip (1, 2 or N channels) into a stereo destination.
-fn pan_into(src: &[Vec<f32>], frames: usize, dst: &mut [Vec<f32>], pans: &[f32; 2], law: PanLaw) {
-    let (l, r) = dst.split_at_mut(1);
-    let (Some(dl), Some(dr)) = (l.first_mut(), r.first_mut()) else { return };
-    match src.len() {
-        0 => {}
-        1 => {
-            let (gl, gr) = gains(pans[0], law);
-            if let Some(s0) = src.first() {
-                for i in 0..frames {
-                    let v = s0.get(i).copied().unwrap_or(0.0);
-                    if let (Some(a), Some(b)) = (dl.get_mut(i), dr.get_mut(i)) {
-                        *a += v * gl;
-                        *b += v * gr;
+/// Per-block routing gains: `m[src][dst]`.
+type Matrix = [[f32; MAX_CHANNELS]; MAX_CHANNELS];
+
+/// How a source is panned: the stereo pan pair (mono uses `[0]`) and the optional surround pan.
+struct PanSpec<'a> {
+    stereo: [f32; 2],
+    surround: Option<&'a SurroundPan>,
+}
+
+fn identity_matrix(n: usize) -> Matrix {
+    let mut m = [[0.0; MAX_CHANNELS]; MAX_CHANNELS];
+    for (i, row) in m.iter_mut().enumerate().take(n) {
+        if let Some(g) = row.get_mut(i) {
+            *g = 1.0;
+        }
+    }
+    m
+}
+
+/// ITU-R BS.775 stereo fold-down gains (to L, to R) for one speaker: C and surrounds at -3 dB,
+/// the centre surround at -6 dB per side, LFE dropped.
+pub fn itu_stereo_fold(sp: Speaker) -> (f32, f32) {
+    use Speaker::*;
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    match sp {
+        L | Lc | Lw => (1.0, 0.0),
+        R | Rc | Rw => (0.0, 1.0),
+        C => (h, h),
+        Lfe => (0.0, 0.0),
+        Cs => (0.5, 0.5),
+        Ls | Lss | Lrs | Ltf | Ltm | Ltr => (h, 0.0),
+        Rs | Rss | Rrs | Rtf | Rtm | Rtr => (0.0, h),
+    }
+}
+
+/// Speaker directions of a format (for the DSP panner). Returns the count written.
+fn layout_of(fmt: ChannelFormat, out: &mut [SpeakerPos; MAX_CHANNELS]) -> usize {
+    let sp = fmt.speakers();
+    for (o, s) in out.iter_mut().zip(sp.iter()) {
+        *o = SpeakerPos { az: s.azimuth(), el: s.elevation(), lfe: s.is_lfe() };
+    }
+    sp.len().min(MAX_CHANNELS)
+}
+
+fn surround_params(sp: &SurroundPan, dx: f32) -> SurroundParams {
+    SurroundParams { x: (sp.x + dx).clamp(-1.0, 1.0), y: sp.y, z: sp.z, divergence: sp.divergence, center: sp.center / 100.0 }
+}
+
+/// Routing gains from a source (`ns` channels of `src_fmt`) into a destination (`nd` channels of
+/// `dst_fmt`). See the crate docs for the rules.
+fn build_matrix(src_fmt: ChannelFormat, ns: usize, dst_fmt: ChannelFormat, nd: usize, pan: &PanSpec<'_>, law: PanLaw) -> Matrix {
+    let mut m = [[0.0f32; MAX_CHANNELS]; MAX_CHANNELS];
+    let (ns, nd) = (ns.min(MAX_CHANNELS), nd.min(MAX_CHANNELS));
+    if ns == 0 || nd == 0 {
+        return m;
+    }
+    let set = |m: &mut Matrix, s: usize, d: usize, g: f32| {
+        if let Some(x) = m.get_mut(s).and_then(|r| r.get_mut(d)) {
+            *x += g;
+        }
+    };
+    if nd == 1 {
+        // Mono destination: the stereo routing summed at -6 dB.
+        let st = build_matrix(src_fmt, ns, ChannelFormat::Stereo, 2, pan, law);
+        for (row, srow) in m.iter_mut().zip(st.iter()).take(ns) {
+            row[0] = 0.5 * (srow[0] + srow[1]);
+        }
+        return m;
+    }
+    let src_sp = src_fmt.speakers();
+    let src_amb = src_fmt.is_ambisonic() && ns >= 4;
+    if nd == 2 && !dst_fmt.is_ambisonic() {
+        match ns {
+            1 => {
+                let (gl, gr) = gains(pan.stereo[0], law);
+                m[0][0] = gl;
+                m[0][1] = gr;
+            }
+            2 if !src_amb => {
+                let (a_l, a_r) = gains(pan.stereo[0], PanLaw::Zero);
+                let (b_l, b_r) = gains(pan.stereo[1], PanLaw::Zero);
+                m[0] = [0.0; MAX_CHANNELS];
+                m[0][0] = a_l;
+                m[0][1] = a_r;
+                m[1][0] = b_l;
+                m[1][1] = b_r;
+            }
+            _ if src_amb => {
+                for (d, az) in [(0usize, -30.0f32), (1, 30.0)] {
+                    let g = soundcraft_dsp::pan::ambisonic_decode(az, 0.0, 2);
+                    for (c, gc) in g.iter().enumerate() {
+                        set(&mut m, c, d, *gc);
+                    }
+                }
+            }
+            _ if src_sp.len() == ns => {
+                for (s, sp) in src_sp.iter().enumerate() {
+                    let (l, r) = itu_stereo_fold(*sp);
+                    set(&mut m, s, 0, l);
+                    set(&mut m, s, 1, r);
+                }
+            }
+            _ => {
+                // Unknown layout: first two channels to L/R, the rest to the centre.
+                let h = std::f32::consts::FRAC_1_SQRT_2;
+                m[0][0] = 1.0;
+                m[1][1] = 1.0;
+                for row in m.iter_mut().take(ns).skip(2) {
+                    row[0] = h;
+                    row[1] = h;
+                }
+            }
+        }
+        return m;
+    }
+    if ns > 2 && src_fmt == dst_fmt && ns == nd {
+        return identity_matrix(ns);
+    }
+    // Multichannel destination.
+    let mut layout = [SpeakerPos::default(); MAX_CHANNELS];
+    let nl = layout_of(dst_fmt, &mut layout);
+    let layout = layout.get(..nl).unwrap_or(&[]);
+    let dst_sp = dst_fmt.speakers();
+    let dst_amb = dst_fmt.is_ambisonic();
+    let find = |sp: Speaker| dst_sp.iter().position(|x| *x == sp).filter(|i| *i < nd);
+    let mut g = [0.0f32; MAX_CHANNELS];
+    if dst_amb {
+        if src_amb || (src_fmt.is_ambisonic() && ns > 2) {
+            return identity_matrix(ns.min(nd));
+        }
+        let mut enc = |m: &mut Matrix, s: usize, az: f32, el: f32, spread: f32| {
+            soundcraft_dsp::pan::ambisonic_encode(az, el, spread, &mut g);
+            for (d, gd) in g.iter().enumerate().take(nd) {
+                set(m, s, d, *gd);
+            }
+        };
+        match (ns, pan.surround) {
+            (1 | 2, Some(sp)) => {
+                for s in 0..ns {
+                    let dx = if ns == 2 { if s == 0 { -1.0 } else { 1.0 } } else { 0.0 };
+                    let p = surround_params(sp, dx);
+                    enc(&mut m, s, soundcraft_dsp::pan::puck_azimuth(&[], p.x, p.y), p.z * 90.0, p.divergence);
+                }
+            }
+            (1, None) => enc(&mut m, 0, pan.stereo[0].clamp(-1.0, 1.0) * 30.0, 0.0, 0.0),
+            (2, None) => {
+                enc(&mut m, 0, -30.0, 0.0, 0.0);
+                enc(&mut m, 1, 30.0, 0.0, 0.0);
+            }
+            _ => {
+                for (s, sp) in src_sp.iter().enumerate().take(ns) {
+                    if !sp.is_lfe() {
+                        enc(&mut m, s, sp.azimuth(), sp.elevation(), 0.0);
                     }
                 }
             }
         }
-        n => {
-            // Stereo: each side has its own panner. Wider formats fold extra channels to centre.
-            let (a_l, a_r) = gains(pans[0], PanLaw::Zero);
-            let (b_l, b_r) = gains(pans[1], PanLaw::Zero);
-            for i in 0..frames {
-                let x0 = src.first().and_then(|c| c.get(i)).copied().unwrap_or(0.0);
-                let x1 = src.get(1).and_then(|c| c.get(i)).copied().unwrap_or(0.0);
-                let mut c = 0.0;
-                for ch in src.iter().skip(2).take(n.saturating_sub(2)) {
-                    c += ch.get(i).copied().unwrap_or(0.0) * std::f32::consts::FRAC_1_SQRT_2;
+        return m;
+    }
+    if dst_sp.len() != nd {
+        // No layout to pan on: channel for channel.
+        return identity_matrix(ns.min(nd));
+    }
+    let (li, ri) = (find(Speaker::L), find(Speaker::R));
+    match (ns, pan.surround) {
+        (1 | 2, Some(sp)) if !src_amb => {
+            for s in 0..ns {
+                let dx = if ns == 2 { if s == 0 { -1.0 } else { 1.0 } } else { 0.0 };
+                soundcraft_dsp::pan::surround_gains(layout, &surround_params(sp, dx), &mut g);
+                for (d, gd) in g.iter().enumerate().take(nd) {
+                    set(&mut m, s, d, *gd);
                 }
-                if let (Some(a), Some(b)) = (dl.get_mut(i), dr.get_mut(i)) {
-                    *a += x0 * a_l + x1 * b_l + c;
-                    *b += x0 * a_r + x1 * b_r + c;
+                if let Some(lfe) = find(Speaker::Lfe)
+                    && sp.lfe_db > -143.9
+                {
+                    set(&mut m, s, lfe, db_to_gain(sp.lfe_db.min(12.0)) / ns as f32);
                 }
             }
+        }
+        (1, None) => {
+            let (gl, gr) = gains(pan.stereo[0], law);
+            if let (Some(l), Some(r)) = (li, ri) {
+                set(&mut m, 0, l, gl);
+                set(&mut m, 0, r, gr);
+            }
+        }
+        (2, None) if !src_amb => {
+            let (a_l, a_r) = gains(pan.stereo[0], PanLaw::Zero);
+            let (b_l, b_r) = gains(pan.stereo[1], PanLaw::Zero);
+            if let (Some(l), Some(r)) = (li, ri) {
+                set(&mut m, 0, l, a_l);
+                set(&mut m, 0, r, a_r);
+                set(&mut m, 1, l, b_l);
+                set(&mut m, 1, r, b_r);
+            }
+        }
+        _ if src_amb => {
+            let n_spk = dst_sp.iter().filter(|s| !s.is_lfe()).count();
+            for (d, sp) in dst_sp.iter().enumerate().take(nd) {
+                if sp.is_lfe() {
+                    continue;
+                }
+                let dec = soundcraft_dsp::pan::ambisonic_decode(sp.azimuth(), sp.elevation(), n_spk);
+                for (c, gc) in dec.iter().enumerate() {
+                    set(&mut m, c, d, *gc);
+                }
+            }
+        }
+        _ if src_sp.len() == ns => {
+            for (s, sp) in src_sp.iter().enumerate() {
+                if let Some(d) = find(*sp) {
+                    set(&mut m, s, d, 1.0);
+                } else if sp.is_lfe() {
+                    // No LFE in the destination: dropped.
+                } else {
+                    soundcraft_dsp::pan::direction_gains(layout, sp.azimuth(), sp.elevation(), &mut g);
+                    for (d, gd) in g.iter().enumerate().take(nd) {
+                        set(&mut m, s, d, *gd);
+                    }
+                }
+            }
+        }
+        _ => return identity_matrix(ns.min(nd)),
+    }
+    m
+}
+
+/// `dst[d] += Σ_s src[s] × gain × m[s][d]` for every destination channel (no allocation).
+fn apply_matrix(src: &[Vec<f32>], frames: usize, dst: &mut [Vec<f32>], m: &Matrix, gain: f32) {
+    let ns = src.len().min(MAX_CHANNELS);
+    for (d, out) in dst.iter_mut().enumerate().take(MAX_CHANNELS) {
+        let mut idx = [(0usize, 0.0f32); MAX_CHANNELS];
+        let mut k = 0;
+        for (s, row) in m.iter().enumerate().take(ns) {
+            let g = row.get(d).copied().unwrap_or(0.0);
+            if g != 0.0
+                && let Some(slot) = idx.get_mut(k)
+            {
+                *slot = (s, g);
+                k += 1;
+            }
+        }
+        let taps = idx.get(..k).unwrap_or(&[]);
+        if taps.is_empty() {
+            continue;
+        }
+        for (i, o) in out.iter_mut().enumerate().take(frames) {
+            let mut acc = 0.0f32;
+            for &(s, g) in taps {
+                acc += src.get(s).and_then(|c| c.get(i)).copied().unwrap_or(0.0) * gain * g;
+            }
+            *o += acc;
         }
     }
 }
 
-fn mix_to_bus(
-    src: &[Vec<f32>],
-    frames: usize,
-    busses: &mut HashMap<BusId, Vec<Vec<f32>>>,
-    target: &Route,
-    gain: f32,
-    send_pan: f32,
-    law: PanLaw,
-    track_pan: &[f32],
-) {
-    let Route::Bus(b) = target else { return };
-    let Some(dst) = busses.get_mut(b) else { return };
-    let pans = if src.len() == 1 { [send_pan, 0.0] } else { [track_pan.first().copied().unwrap_or(-1.0), track_pan.get(1).copied().unwrap_or(1.0)] };
-    if gain <= 0.0 {
-        return;
-    }
-    // Scale via a temporary pass over the destination: add gain*src.
-    let (l, r) = dst.split_at_mut(1);
-    let (Some(dl), Some(dr)) = (l.first_mut(), r.first_mut()) else { return };
-    if src.len() == 1 {
-        let (gl, gr) = gains(pans[0], law);
-        if let Some(s0) = src.first() {
-            for i in 0..frames {
-                let v = s0.get(i).copied().unwrap_or(0.0) * gain;
-                if let (Some(a), Some(bb)) = (dl.get_mut(i), dr.get_mut(i)) {
-                    *a += v * gl;
-                    *bb += v * gr;
-                }
-            }
-        }
-    } else {
-        for i in 0..frames {
-            let x0 = src.first().and_then(|c| c.get(i)).copied().unwrap_or(0.0) * gain;
-            let x1 = src.get(1).and_then(|c| c.get(i)).copied().unwrap_or(0.0) * gain;
-            if let (Some(a), Some(bb)) = (dl.get_mut(i), dr.get_mut(i)) {
-                *a += x0;
-                *bb += x1;
-            }
-        }
-    }
-}
+/// Ceiling on one offline render (samples summed over channels): 2^29 f32 = 2 GiB, about 93
+/// minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory.
+pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
 
-/// Offline render of the main mix over `range` (stereo, planar). The mix's delay-compensation
-/// latency is removed, so the result lines up with the timeline.
+/// Offline render of the main mix over `range` (planar, [`main_channels`] channels in SMPTE/WAV
+/// order). The mix's delay-compensation latency is removed, so the result lines up with the
+/// timeline.
 pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0);
+    let nch = main_channels(s);
+    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
     // Probe the latency with one block, then render `len + latency` and drop the head.
     let latency = {
         let mut probe = MixEngine::new(s.sample_rate.as_f64() as f32, block);
         let b = probe.max_block();
-        let mut tmp = vec![vec![0.0f32; b]; MAIN_CHANNELS];
+        let mut tmp = vec![vec![0.0f32; b]; nch];
         probe.render(s, range.start, b.min(len.max(1)), &mut tmp);
         probe.latency
     };
     let total = len.saturating_add(latency);
-    let mut out = vec![vec![0.0f32; total]; MAIN_CHANNELS];
+    let mut out = vec![vec![0.0f32; total]; nch];
     let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
     let b = eng.max_block();
-    let mut tmp = vec![vec![0.0f32; b]; MAIN_CHANNELS];
+    let mut tmp = vec![vec![0.0f32; b]; nch];
     let mut done = 0usize;
     while done < total {
         let n = (total - done).min(b);
@@ -1037,10 +1309,40 @@ pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
     out
 }
 
+/// ITU-R BS.775 stereo fold-down of planar audio in `fmt` (C and surrounds at -3 dB, LFE dropped;
+/// Ambisonics play their W channel). Mono/stereo input is returned unchanged.
+pub fn fold_down_stereo(fmt: ChannelFormat, ch: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    if ch.len() <= 2 {
+        return ch.to_vec();
+    }
+    let len = ch.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = vec![vec![0.0f32; len]; 2];
+    let sp = fmt.speakers();
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    for (c, src) in ch.iter().enumerate() {
+        let (gl, gr) = match sp.get(c) {
+            Some(x) if sp.len() == ch.len() => itu_stereo_fold(*x),
+            _ if c == 0 => (h, h),
+            _ => (0.0, 0.0),
+        };
+        for (g, dst) in [(gl, 0usize), (gr, 1)] {
+            if g == 0.0 {
+                continue;
+            }
+            if let Some(d) = out.get_mut(dst) {
+                for (o, x) in d.iter_mut().zip(src.iter()) {
+                    *o += x * g;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Render only one track's clips (no mixer processing) — Consolidate.
 pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
     let Some(t) = s.track(track) else { return Vec::new() };
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0);
+    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / t.channels().max(1));
     let mut out = vec![vec![0.0f32; len]; t.channels().max(1)];
     let mut scratch = Vec::new();
     for c in t.clips() {
@@ -1077,6 +1379,9 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
 /// Render one track through its inserts (pre-fader) — Commit / Freeze.
 pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
     let mut solo = s.clone();
+    // Multichannel tracks render into a main mix of their own format (straight through).
+    let fmt = s.track(track).map_or(ChannelFormat::Stereo, |t| if t.channels() > 2 { t.format } else { ChannelFormat::Stereo });
+    solo.outputs = vec![soundcraft_model::OutputPath { name: "Out".into(), first_channel: 0, format: fmt }];
     for t in &mut solo.tracks {
         if t.id == track {
             t.mixer.volume_db = 0.0;
@@ -1089,6 +1394,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
             };
             t.automation.retain(|l| matches!(l.param, AutoParam::Plugin { .. }));
             t.mixer.sends.iter_mut().for_each(|x| *x = None);
+            t.mixer.surround = None;
         } else {
             t.inactive = true;
         }
@@ -1106,14 +1412,14 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
 fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
-    soundcraft_dsp::create(id).or_else(|| soundcraft_clap_host::create(id))
+    soundcraft_dsp::create(id).or_else(|| soundcraft_clap_host::create(id)).or_else(|| soundcraft_vst3_host::create(id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use soundcraft_audio_io::AudioBuffer;
-    use soundcraft_model::{ChannelFormat, Insert, SourceAudio, SourceId};
+    use soundcraft_model::{Insert, SourceAudio, SourceId};
     use std::sync::Arc;
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {
@@ -1292,5 +1598,111 @@ mod tests {
         let s = Session::default();
         let out = render_range(&s, Range::new(0, 1000), 128);
         assert!(out.iter().all(|c| c.iter().all(|x| *x == 0.0)));
+    }
+
+    /// A session with one track of `fmt` playing a distinct DC level per channel (0.1, 0.2, …).
+    fn multichannel_session(fmt: ChannelFormat, main: ChannelFormat, frames: usize) -> (Session, TrackId) {
+        let mut s = Session::default();
+        s.outputs[0].format = main;
+        let t = s.add_track(TrackKind::Audio, fmt, None);
+        let chans: Vec<Vec<f32>> = (0..fmt.channels()).map(|c| (0..frames).map(|i| 0.1 * (c + 1) as f32 + (i % 7) as f32 * 1e-3).collect()).collect();
+        s.pool.insert(SourceId(901), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: chans })));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "mc", SourceId(901), 0, 0, frames as i64));
+        (s, t)
+    }
+
+    #[test]
+    fn surround_track_passes_through_bit_exact() {
+        let (s, _) = multichannel_session(ChannelFormat::Surround51, ChannelFormat::Surround51, 4800);
+        let src = s.pool.get(SourceId(901)).unwrap().buffer.channels.clone();
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert_eq!(out.len(), 6);
+        for (o, x) in out.iter().zip(src.iter()) {
+            assert_eq!(o, x, "5.1 → 5.1 must be bit-exact");
+        }
+    }
+
+    #[test]
+    fn surround_to_stereo_folds_down_itu() {
+        let (s, _) = multichannel_session(ChannelFormat::Surround51, ChannelFormat::Stereo, 4800);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert_eq!(out.len(), 2);
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let x = |c: usize| 0.1 * (c + 1) as f32 + (1000 % 7) as f32 * 1e-3;
+        // L R C LFE Ls Rs.
+        let l = x(0) + h * x(2) + h * x(4);
+        let r = x(1) + h * x(2) + h * x(5);
+        assert!((out[0][1000] - l).abs() < 1e-5, "{} vs {l}", out[0][1000]);
+        assert!((out[1][1000] - r).abs() < 1e-5, "{} vs {r}", out[1][1000]);
+    }
+
+    #[test]
+    fn mono_track_on_surround_main_pans() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        s.outputs[0].format = ChannelFormat::Surround51;
+        // No surround pan: stereo behaviour on L/R.
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert_eq!(out.len(), 6);
+        let h = 0.5 * gains(0.0, PanLaw::Minus3).0;
+        assert!((out[0][100] - h).abs() < 1e-6 && (out[1][100] - h).abs() < 1e-6);
+        assert!(out[2..].iter().all(|c| c[100].abs() < 1e-7));
+        // Front centre: the centre speaker only.
+        s.track_mut(t).unwrap().mixer.surround = Some(SurroundPan::default());
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert!((out[2][100] - 0.5).abs() < 1e-4, "{}", out[2][100]);
+        assert!(out.iter().enumerate().all(|(c, x)| c == 2 || x[100].abs() < 1e-4));
+        // Rear right with LFE: Rs plus the LFE send.
+        s.track_mut(t).unwrap().mixer.surround = Some(SurroundPan { x: 1.0, y: -1.0, lfe_db: -6.0, ..SurroundPan::default() });
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut buf = vec![vec![0.0; 512]; 6];
+        eng.render(&s, 0, 512, &mut buf);
+        assert!((buf[5][100] - 0.5).abs() < 1e-4 && (buf[3][100] - 0.5 * db_to_gain(-6.0)).abs() < 1e-4);
+        assert_eq!(eng.main_meter.peaks.len(), 6);
+        assert_eq!(eng.meters.get(&t).map(|m| m.peaks.len()), Some(1));
+        // A stereo device buffer gets the first two channels.
+        let mut two = vec![vec![1.0; 512]; 2];
+        eng.render(&s, 512, 512, &mut two);
+        assert!(two[0][10].abs() < 1e-6);
+    }
+
+    #[test]
+    fn surround_busses_and_master_fader() {
+        let (mut s, t) = multichannel_session(ChannelFormat::Surround51, ChannelFormat::Surround51, 4800);
+        let bus = s.add_bus("Stem", ChannelFormat::Surround51);
+        let aux = s.add_track(TrackKind::Aux, ChannelFormat::Surround51, Some("Stem"));
+        s.track_mut(aux).unwrap().mixer.input = Route::Bus(bus);
+        s.track_mut(t).unwrap().mixer.output = Route::Bus(bus);
+        let m = s.add_track(TrackKind::Master, ChannelFormat::Surround51, None);
+        s.track_mut(m).unwrap().mixer.volume_db = -6.0;
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        let g = db_to_gain(-6.0);
+        for (c, ch) in out.iter().enumerate() {
+            let x = 0.1 * (c + 1) as f32 + (1000 % 7) as f32 * 1e-3;
+            assert!((ch[1000] - x * g).abs() < 1e-5, "channel {c}: {} vs {}", ch[1000], x * g);
+        }
+        // A mono bus sums a stereo source like the old stereo bus did.
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let bus = s.add_bus("Mono", ChannelFormat::Mono);
+        let aux = s.add_track(TrackKind::Aux, ChannelFormat::Mono, Some("M"));
+        s.track_mut(aux).unwrap().mixer.input = Route::Bus(bus);
+        s.track_mut(aux).unwrap().mixer.pan = vec![-1.0];
+        s.track_mut(t).unwrap().mixer.output = Route::Bus(bus);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert!((out[0][1000] - 0.5 * gains(0.0, PanLaw::Minus3).0).abs() < 1e-6, "{}", out[0][1000]);
+    }
+
+    #[test]
+    fn surround_upmix_and_downmix_between_layouts() {
+        // 5.1 → 7.1: shared speakers map 1:1; 5.x surrounds pan between the 7.1 sides and rears.
+        let (s, _) = multichannel_session(ChannelFormat::Surround51, ChannelFormat::Surround71, 2000);
+        let out = render_range(&s, Range::new(0, 2000), 512);
+        assert_eq!(out.len(), 8);
+        let x = |c: usize| 0.1 * (c + 1) as f32 + (100 % 7) as f32 * 1e-3;
+        for (c, ch) in out.iter().enumerate().take(4) {
+            assert!((ch[100] - x(c)).abs() < 1e-6);
+        }
+        let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
+        assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
     }
 }

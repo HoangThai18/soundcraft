@@ -81,7 +81,7 @@ fn agent_builds_and_mixes_a_session() {
     tool(
         &mut s,
         "execute",
-        json!({"command": "edit.select", "params": {"tracks": ["Snare"], "start": "bars_beats:5|1|000", "end": "bars_beats:9|1|000"}}),
+        json!({"command": "edit.select", "params": {"tracks": ["Snare"], "start": "bars_beats:6|1|000", "end": "bars_beats:9|1|000"}}),
     );
     tool(&mut s, "execute", json!({"command": "edit.cut", "params": {}}));
     let mid = track(&session(&mut s), "Snare")["clips"].as_array().unwrap().len();

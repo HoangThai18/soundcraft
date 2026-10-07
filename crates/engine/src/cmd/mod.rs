@@ -22,11 +22,13 @@ mod more_util;
 mod options;
 mod query;
 mod setup_more;
+mod surround;
 mod track;
 mod track_more;
 mod transport;
 mod view;
 mod view_more;
+mod vst3;
 
 pub type Run = fn(&mut Engine, &Value) -> Result<Value>;
 /// `Err(reason)` = disabled.
@@ -112,6 +114,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(event_more::specs());
         v.extend(setup_more::specs());
         v.extend(clap::specs());
+        v.extend(vst3::specs());
+        v.extend(surround::specs());
         v
     })
 }
@@ -222,8 +226,17 @@ pub fn tracks_required(e: &Engine, cmd: &str, p: &Value) -> Result<Vec<TrackId>>
     if t.is_empty() { Err(bad(cmd, "no tracks: pass `track`/`tracks` or select tracks")) } else { Ok(t) }
 }
 
+/// Largest position accepted from parameters: 2^40 samples (about 265 days at 48 kHz). Clamping
+/// here keeps every later addition and subtraction on positions far away from overflow.
+pub const MAX_POSITION: Samples = 1 << 40;
+
 /// Position from `key`: a number of samples, or `{"seconds": x}`, or a string in the main counter format.
+/// Values are clamped to ±[`MAX_POSITION`].
 pub fn position_param(e: &Engine, cmd: &str, p: &Value, key: &str) -> Result<Option<Samples>> {
+    Ok(position_param_raw(e, cmd, p, key)?.map(|v| v.clamp(-MAX_POSITION, MAX_POSITION)))
+}
+
+fn position_param_raw(e: &Engine, cmd: &str, p: &Value, key: &str) -> Result<Option<Samples>> {
     let Some(v) = p.get(key) else { return Ok(None) };
     let s = e.session();
     if let Some(n) = v.as_i64() {
