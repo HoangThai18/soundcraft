@@ -115,27 +115,16 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({}))
         }),
-        cmd!("clip.elastic_properties", "Elastic Properties", ["Clip"], Some("Alt+5"), "{clips?, ratio?: 1.0}", has_selection, |e, p| {
-            let ids = clip_ids_param(e, p);
-            let r = f64_or(p, "ratio", 1.0).clamp(0.05, 20.0);
-            let s = e.session_mut();
-            for id in &ids {
-                if let Some(c) = s.find_clip_mut(*id) {
-                    c.stretch = r
-                }
-            }
-            Ok(json!({"ratio": r}))
-        }),
-        cmd!("clip.remove_warp", "Remove Warp", ["Clip"], None, "{clips?}", has_selection, |e, p| {
-            let ids = clip_ids_param(e, p);
-            let s = e.session_mut();
-            for id in &ids {
-                if let Some(c) = s.find_clip_mut(*id) {
-                    c.stretch = 1.0
-                }
-            }
-            Ok(json!({}))
-        }),
+        cmd!(
+            "clip.elastic_properties",
+            "Elastic Properties",
+            ["Clip"],
+            Some("Alt+5"),
+            "{clips?, ratio?: 1.0} — on Elastic Audio tracks (polyphonic/rhythmic/monophonic/x-form) the stretch is rendered pitch-preserving; elsewhere it is varispeed",
+            has_selection,
+            elastic
+        ),
+        cmd!("clip.remove_warp", "Remove Warp", ["Clip"], None, "{clips?}", has_selection, remove_warp),
         cmd!("clip.capture", "Capture...", ["Clip"], Some("Cmd+R"), "{name?}", has_range, |e, p| {
             // Captures the selection as a new whole-file-referencing clip in the clip list (we keep it on the track).
             let name = str_param(p, "name").unwrap_or("Captured").to_string();
@@ -149,6 +138,79 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"clips": ids.len()}))
         }),
     ]
+}
+
+/// Warp clips. On Elastic tracks the material is rendered with a pitch-preserving time stretch
+/// (the original source is remembered in `edit.values` so Remove Warp restores it).
+fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
+    let ids = clip_ids_param(e, p);
+    let ratio = f64_or(p, "ratio", 1.0).clamp(0.05, 20.0);
+    let s = e.session_mut();
+    let mut rendered = 0;
+    for id in &ids {
+        let Some((t, c)) = s.find_clip(*id).map(|(t, c)| (t, c.clone())) else { continue };
+        let elastic = s.track(t).and_then(|x| x.elastic.clone()).filter(|a| a != "varispeed");
+        // Start from the unwarped original if this clip was warped before.
+        let key = |k: &str| format!("elastic.{}.{k}", id.0);
+        let orig = match (s.edit.values.get(&key("src")), s.edit.values.get(&key("off")), s.edit.values.get(&key("len"))) {
+            (Some(src), Some(off), Some(len)) => Some((soundcraft_model::SourceId(*src as u64), *off as i64, *len as i64)),
+            _ => None,
+        };
+        let mut base = c.clone();
+        if let Some((src, off, len)) = orig {
+            base.content = soundcraft_model::ClipContent::Audio { source: src, offset: off };
+            base.length = len.max(1);
+            base.stretch = 1.0;
+        }
+        if elastic.is_none() || !base.is_audio() {
+            if let Some(cm) = s.find_clip_mut(*id) {
+                cm.stretch = ratio;
+            }
+            continue;
+        }
+        let out_len = soundcraft_time::to_samples(base.length as f64 * ratio).max(1);
+        let mut warp = base.clone();
+        warp.stretch = ratio;
+        let Some(src) = super::more_util::render_stretched(s, "clip.elastic_properties", &warp, out_len)? else { continue };
+        if orig.is_none()
+            && let soundcraft_model::ClipContent::Audio { source, offset } = base.content
+        {
+            s.edit.values.insert(key("src"), source.0 as f64);
+            s.edit.values.insert(key("off"), offset as f64);
+            s.edit.values.insert(key("len"), base.length as f64);
+        }
+        s.edit.values.insert(key("ratio"), ratio);
+        let mut nc = base;
+        nc.content = soundcraft_model::ClipContent::Audio { source: src, offset: 0 };
+        nc.length = out_len;
+        nc.stretch = 1.0;
+        super::more_util::replace_clip(s, t, *id, nc);
+        rendered += 1;
+    }
+    Ok(json!({"ratio": ratio, "rendered": rendered}))
+}
+
+fn remove_warp(e: &mut Engine, p: &Value) -> Result<Value> {
+    let ids = clip_ids_param(e, p);
+    let s = e.session_mut();
+    let mut n = 0;
+    for id in &ids {
+        let key = |k: &str| format!("elastic.{}.{k}", id.0);
+        let orig = (s.edit.values.get(&key("src")).copied(), s.edit.values.get(&key("off")).copied(), s.edit.values.get(&key("len")).copied());
+        if let Some(c) = s.find_clip_mut(*id) {
+            c.stretch = 1.0;
+            if let (Some(src), Some(off), Some(len)) = orig {
+                c.content = soundcraft_model::ClipContent::Audio { source: soundcraft_model::SourceId(src as u64), offset: off as i64 };
+                c.length = (len as i64).max(1);
+                c.fade_out.len = c.fade_out.len.min(c.length);
+                n += 1;
+            }
+        }
+        for k in ["src", "off", "len", "ratio"] {
+            s.edit.values.remove(&key(k));
+        }
+    }
+    Ok(json!({"restored": n}))
 }
 
 fn flag(e: &mut Engine, p: &Value, get: fn(&soundcraft_model::Clip) -> bool, set: fn(&mut soundcraft_model::Clip, bool)) -> Result<Value> {
@@ -246,4 +308,30 @@ fn quantize_to_grid(e: &mut Engine, p: &Value) -> Result<Value> {
         crate::edit::move_clips(s, &[*id], *d, None);
     }
     Ok(json!({"clips": moves.len()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use soundcraft_model::{ClipId, TrackId};
+
+    #[test]
+    fn elastic_warp_renders_and_remove_warp_restores() {
+        let mut e = crate::demo::demo_engine();
+        let pad = e.session().track_by_name("Pad").map(|t| t.id.0).unwrap();
+        e.execute("track.elastic", &json!({"track": pad, "algorithm": "polyphonic"})).unwrap();
+        let cid = e.session().track(TrackId(pad)).unwrap().clips()[0].id.0;
+        let len0 = e.session().find_clip(ClipId(cid)).unwrap().1.length;
+        let r = e.execute("clip.elastic_properties", &json!({"clips": [cid], "ratio": 1.5})).unwrap();
+        assert_eq!(r["rendered"], 1);
+        let c = e.session().find_clip(ClipId(cid)).unwrap().1.clone();
+        assert!((c.length as f64 - len0 as f64 * 1.5).abs() < 2.0, "{} vs {}", c.length, len0);
+        assert_eq!(c.stretch, 1.0);
+        // Re-warping starts from the original, not the rendered audio.
+        e.execute("clip.elastic_properties", &json!({"clips": [cid], "ratio": 0.5})).unwrap();
+        let c = e.session().find_clip(ClipId(cid)).unwrap().1.clone();
+        assert!((c.length as f64 - len0 as f64 * 0.5).abs() < 2.0);
+        e.execute("clip.remove_warp", &json!({"clips": [cid]})).unwrap();
+        assert_eq!(e.session().find_clip(ClipId(cid)).unwrap().1.length, len0);
+    }
 }
