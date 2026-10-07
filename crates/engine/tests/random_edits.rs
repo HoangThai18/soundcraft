@@ -36,6 +36,24 @@ const CMDS: &[&str] = &[
     "track.new",
     "track.duplicate",
     "track.delete",
+    "edit.space_clips",
+    "edit.snap_next",
+    "edit.snap_previous",
+    "edit.duplicate_extend",
+    "edit.tce_to_timeline",
+    "clip.unloop",
+    "clip.conform_to_tempo",
+    "event.tempo_linear",
+    "event.insert_time",
+    "event.cut_time",
+    "edit.copy_to_new_playlist",
+    "edit.move_to_new_playlist",
+    "track.change_width",
+    "clip.elastic_properties",
+    "audiosuite.process",
+    "event.beat_detective",
+    "automation.thin",
+    "clip.remove_warp",
 ];
 
 fn params(i: usize, a: i64, b: i64, track: &str) -> Value {
@@ -59,6 +77,16 @@ fn params(i: usize, a: i64, b: i64, track: &str) -> Value {
         "markers.add" => json!({"at": s}),
         "track.new" => json!({"format": "Stereo"}),
         "track.duplicate" | "track.delete" => json!({"tracks": [track]}),
+        "edit.space_clips" => json!({"tracks": [track], "start": s, "end": e, "gap": {"seconds": 0.25}}),
+        "event.tempo_linear" => json!({"start": s, "end": e, "start_bpm": 90.0, "end_bpm": 130.0}),
+        "event.insert_time" => json!({"start": s, "length": {"seconds": 1.0}}),
+        "track.change_width" => json!({"tracks": [track], "format": if a % 2 == 0 { "Stereo" } else { "Mono" }}),
+        "clip.elastic_properties" => json!({"ratio": 0.5 + (a.unsigned_abs() % 150) as f64 / 100.0}),
+        "audiosuite.process" => {
+            let p = ["normalize", "reverse", "invert", "gain"][(b.unsigned_abs() % 4) as usize];
+            json!({ "process": p })
+        }
+        "event.beat_detective" => json!({"tracks": [track], "start": s, "end": e, "separate": true}),
         _ => json!({"tracks": [track], "start": s, "end": e}),
     }
 }
@@ -91,7 +119,7 @@ fn check_invariants(e: &Engine) -> Result<(), String> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 48, .. ProptestConfig::default() })]
     #[test]
-    fn random_edits_keep_the_session_sane(ops in proptest::collection::vec((0usize..30, -100_000i64..3_000_000, -100_000i64..3_000_000, 0usize..5), 1..25)) {
+    fn random_edits_keep_the_session_sane(ops in proptest::collection::vec((0usize..48, -100_000i64..3_000_000, -100_000i64..3_000_000, 0usize..5), 1..25)) {
         let mut e = soundcraft_engine::demo::demo_engine();
         let original = serde_json::to_value(e.session()).unwrap();
         let names = ["Kick", "Snare", "Bass", "Pad", "Keys"];
