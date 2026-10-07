@@ -217,6 +217,9 @@ pub fn demo_session() -> Session {
     let b = bass(srf, total);
     let (pl, pr) = pad(srf, total);
     let verb_bus = s.add_bus("Verb", ChannelFormat::Stereo);
+    // Exact bar positions from the tempo map (bar index 0 = bar 1).
+    let tempo = s.tempo.clone();
+    let bar_at = move |n: usize| tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: n as i64 + 1, beat: 1, tick: 0 }, sr);
     let add_audio = |s: &mut Session, name: &str, chans: Vec<Vec<f32>>, start_bar: usize, color: Option<usize>| {
         let fmt = ChannelFormat::for_channels(chans.len());
         let buf = AudioBuffer { sample_rate: sr.hz(), channels: chans };
@@ -225,8 +228,8 @@ pub fn demo_session() -> Session {
         if let (Some(c), Some(tr)) = (color, s.track_mut(t)) {
             tr.color = soundcraft_model::TRACK_COLORS[c % 16];
         }
-        let start = (start_bar * bar) as i64;
-        let len = (total - start_bar * bar) as i64;
+        let start = bar_at(start_bar);
+        let len = total as i64 - start;
         let cid = s.new_clip_id();
         let mut clip = Clip::audio(cid, name, src, start, start, len - (srf * 1.5) as i64);
         clip.fade_out = Fade { len: (srf * 0.5) as i64, shape: FadeShape::SCurve };
@@ -240,19 +243,19 @@ pub fn demo_session() -> Session {
     let tp = add_audio(&mut s, "Pad", vec![pl, pr], 0, Some(1));
     // Split the snare into verse/chorus clips so the playlist shows several clips.
     for at in [12, 20] {
-        crate::edit::separate_at(&mut s, ts, (at * bar) as i64);
-        crate::edit::separate_at(&mut s, tk, (at * bar) as i64);
+        crate::edit::separate_at(&mut s, ts, bar_at(at));
+        crate::edit::separate_at(&mut s, tk, bar_at(at));
     }
     for (i, at) in [8usize, 16].iter().enumerate() {
-        crate::edit::separate_at(&mut s, tb, (*at * bar) as i64);
+        crate::edit::separate_at(&mut s, tb, bar_at(*at));
         let _ = i;
     }
     // Instrument tracks with MIDI.
     let keys = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
     let lead = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Lead"));
     for (t, seq, start_bar, bars, color) in [(keys, keys_sequence(), 4usize, BARS - 4, 2usize), (lead, lead_sequence(), 12, 8, 9)] {
-        let start = (start_bar * bar) as i64;
-        let len = (bars * bar) as i64;
+        let start = bar_at(start_bar);
+        let len = bar_at(start_bar + bars) - start;
         let cid = s.new_clip_id();
         let name = s.track(t).map(|x| x.name.clone()).unwrap_or_default();
         crate::edit::place_clip(&mut s, t, Clip::midi(cid, name, start, len, seq));

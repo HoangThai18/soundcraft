@@ -276,6 +276,11 @@ fn ruler_label(id: &str) -> &'static str {
         "markers" => "Markers",
         "key" => "Key",
         "chords" => "Chords",
+        "timecode2" => "Timecode 2",
+        "markers2" => "Markers 2",
+        "markers3" => "Markers 3",
+        "markers4" => "Markers 4",
+        "markers5" => "Markers 5",
         _ => "",
     }
 }
@@ -351,9 +356,45 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                     );
                 }
             }
-            "markers" => {
-                painter.rect_filled(row, 0.0, t.marker_ruler);
-                for m in &s.markers {
+            "key" => {
+                painter.rect_filled(row, 0.0, Color32::from_rgb(64, 52, 88));
+                if s.key_signatures.is_empty() {
+                    painter.text(pos2(tl.min.x + 6.0, row.center().y), Align2::LEFT_CENTER, "C major", bold(11.0), Color32::from_rgb(220, 214, 236));
+                }
+                for (at, k) in &s.key_signatures {
+                    let x = x_of(&s, tl, *at);
+                    painter.line_segment([pos2(x, row.min.y + 2.0), pos2(x, row.max.y - 2.0)], Stroke::new(2.0, Color32::from_rgb(200, 180, 240)));
+                    painter.text(pos2(x + 5.0, row.center().y), Align2::LEFT_CENTER, k, bold(11.0), Color32::from_rgb(236, 230, 250));
+                }
+                let resp = ui.interact(row, ui.id().with("key_ruler"), Sense::click());
+                if resp.double_clicked()
+                    && let Some(p) = resp.interact_pointer_pos()
+                {
+                    let at = snap(&s, sample_at(&s, tl, p.x).max(0));
+                    let _ = app.run("event.add_key_change", json!({"at": at, "key": "G major"}));
+                }
+            }
+            "timecode2" => {
+                // A second timecode ruler at 25 fps when the session runs at another rate (or 30 otherwise).
+                let alt = if s.frame_rate == soundcraft_time::FrameRate::Fps25 {
+                    soundcraft_time::FrameRate::Fps30
+                } else {
+                    soundcraft_time::FrameRate::Fps25
+                };
+                let mut s2 = s.clone();
+                s2.frame_rate = alt;
+                timebase_ruler(ui, &painter, &s2, tl, row, view, TimeFormat::Timecode, i + 1 == rulers.len());
+            }
+            "markers" | "markers2" | "markers3" | "markers4" | "markers5" | "chords" => {
+                let lane: u8 = match id.as_str() {
+                    "markers2" | "chords" => 2,
+                    "markers3" => 3,
+                    "markers4" => 4,
+                    "markers5" => 5,
+                    _ => 1,
+                };
+                painter.rect_filled(row, 0.0, if id == "chords" { Color32::from_rgb(40, 56, 60) } else { t.marker_ruler });
+                for m in s.markers.iter().filter(|m| m.ruler == lane || (lane == 1 && m.ruler == 0)) {
                     let x = x_of(&s, tl, m.start);
                     let col = m.color.map_or(Color32::from_rgb(232, 200, 64), rgb);
                     if m.kind == soundcraft_model::MarkerKind::Selection {
@@ -374,13 +415,17 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                     painter.text(pos2(x + 8.0, row.center().y), Align2::LEFT_CENTER, &m.name, bold(11.0), Color32::from_rgb(236, 236, 236));
                 }
                 // Click on the marker ruler: recall a marker; double-click adds one.
-                let resp = ui.interact(row, ui.id().with("marker_ruler"), Sense::click());
+                let resp = ui.interact(row, ui.id().with(("marker_ruler", lane)), Sense::click());
                 if let Some(p) = resp.interact_pointer_pos() {
                     if resp.double_clicked() {
                         let at = sample_at(&s, tl, p.x).max(0);
-                        let _ = app.run("markers.add", json!({"at": at}));
+                        let _ = app.run("markers.add", json!({"at": at, "ruler": lane}));
                     } else if resp.clicked()
-                        && let Some(m) = s.markers.iter().find(|m| (x_of(&s, tl, m.start) - p.x).abs() < 8.0)
+                        && let Some(m) = s
+                            .markers
+                            .iter()
+                            .filter(|m| m.ruler == lane || (lane == 1 && m.ruler == 0))
+                            .find(|m| (x_of(&s, tl, m.start) - p.x).abs() < 8.0)
                     {
                         let _ = app.run("markers.recall", json!({"number": m.number}));
                     }
@@ -629,7 +674,7 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         Stroke::new(1.0, Color32::from_rgb(20, 20, 20)),
         StrokeKind::Inside,
     );
-    let shown_name = if app.engine.session().edit.flag("view.track_number") {
+    let shown_name = if app.engine.session().edit.flag("edit_view.track_number") {
         let n = app.engine.session().track_index(id).map_or(0, |i| i + 1);
         format!("{n}  {}", track.name)
     } else {
@@ -947,6 +992,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         body = body.gamma_multiply(0.45);
         wave = Color32::from_rgb(70, 70, 70);
     }
+    let body = if s.edit.flag("view.clip.transparency") { body.gamma_multiply(0.55) } else { body };
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     let name_h = if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
     if name_h > 0.0 {
@@ -1090,6 +1136,54 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             })
             .collect();
         painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));
+    }
+    // Optional clip overlays (View › Clip).
+    let ov = Color32::from_rgb(16, 16, 16);
+    if s.edit.flag("view.clip.rating") && clip.rating > 0 && name_h > 0.0 {
+        painter.text(pos2(r.max.x - 18.0, r.min.y + 7.0), Align2::RIGHT_CENTER, "★".repeat(usize::from(clip.rating.min(5))), regular(9.0), ov);
+    }
+    if s.edit.flag("view.clip.sync_point") && clip.sync_point > 0 {
+        let x = x_of(s, tl, clip.start + clip.sync_point);
+        painter.add(Shape::convex_polygon(
+            vec![pos2(x - 4.0, r.max.y - 1.0), pos2(x + 4.0, r.max.y - 1.0), pos2(x, r.max.y - 7.0)],
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+        painter.line_segment([pos2(x, r.min.y + name_h), pos2(x, r.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90)));
+    }
+    let time_text = if s.edit.flag("view.clip.time.current") {
+        Some(format_position(clip.start, s.edit.main_counter, s.sample_rate, &s.tempo, s.frame_rate, s.timecode_start))
+    } else if s.edit.flag("view.clip.time.original") || s.edit.flag("view.clip.time.user") {
+        clip.source().and_then(|src| s.source(src)).map(|src| {
+            format_position(
+                i64::try_from(src.time_reference).unwrap_or(0) + clip.source_offset(),
+                TimeFormat::Timecode,
+                s.sample_rate,
+                &s.tempo,
+                s.frame_rate,
+                0,
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(tt) = time_text
+        && r.height() > 30.0
+    {
+        painter.with_clip_rect(r.intersect(lane)).text(pos2(r.min.x.max(lane.min.x) + 4.0, r.max.y - 7.0), Align2::LEFT_CENTER, tt, regular(9.0), ov);
+    }
+    if s.edit.flag("view.clip.effects_status") && s.edit.values.keys().any(|k| k.starts_with(&format!("clip_fx.{}.", clip.id.0))) {
+        painter.text(pos2(r.max.x - 6.0, r.max.y - 7.0), Align2::RIGHT_CENTER, "FX", bold(9.0), Color32::from_rgb(250, 230, 120));
+    }
+    if s.edit.flag("view.clip.overlap_shadows") {
+        // Shade where a later clip covers this one (crossfades and layered edits).
+        for o in track.clips() {
+            if o.id != clip.id && o.start > clip.start && o.start < clip.end() {
+                let x0 = x_of(s, tl, o.start);
+                let x1 = x_of(s, tl, clip.end().min(o.end()));
+                painter.rect_filled(Rect::from_min_max(pos2(x0, r.min.y), pos2(x1, r.max.y)), 0.0, Color32::from_black_alpha(70));
+            }
+        }
     }
     if clip.edit_locked || clip.time_locked {
         painter.text(pos2(r.max.x - 10.0, r.min.y + 7.0), Align2::CENTER_CENTER, "🔒", regular(9.0), Color32::WHITE);
@@ -1471,6 +1565,17 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
     let mut scroll_to: Option<Samples> = None;
     let s = app.engine.session();
     let painter = ui.painter().with_clip_rect(area);
+    if s.edit.flag("view.marker.ruler_lines") {
+        for m in &s.markers {
+            let x = x_of(s, tl, m.start);
+            if x > tl.min.x && x < tl.max.x {
+                painter.line_segment(
+                    [pos2(x, tl.min.y), pos2(x, tl.max.y)],
+                    Stroke::new(1.0, m.color.map_or(Color32::from_rgba_unmultiplied(232, 200, 64, 70), |c| rgb(c).gamma_multiply(0.4))),
+                );
+            }
+        }
+    }
     let sel = s.edit.selection;
     // Timeline selection markers on the main ruler.
     if !sel.is_empty() {
