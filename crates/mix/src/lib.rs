@@ -386,9 +386,19 @@ fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &HashMap<Bus
             d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
         }
     }
-    let v0 = volume_db_at(t, pos);
-    let v1 = volume_db_at(t, pos + frames as i64);
-    let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0, v1) };
+    let mut v0 = volume_db_at(t, pos);
+    let mut v1 = volume_db_at(t, pos + frames as i64);
+    // VCA master: its fader offsets the member's, and its mute mutes the member.
+    if let Some(vid) = t.mixer.vca
+        && let Some(vca) = s.tracks.iter().find(|x| x.id.0 == vid && x.kind == TrackKind::Vca)
+    {
+        v0 += volume_db_at(vca, pos);
+        v1 += volume_db_at(vca, pos + frames as i64);
+        if vca.mixer.mute {
+            strip.muted = true;
+        }
+    }
+    let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0.min(12.0), v1.min(12.0)) };
     for c in strip.buf.iter_mut() {
         for i in 0..frames {
             if let Some(x) = c.get_mut(i) {
@@ -596,6 +606,7 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
 
 fn volume_db_at(t: &Track, pos: Samples) -> f32 {
     if t.mixer.automation_mode.reads()
+        && t.mixer.automation_mode != soundcraft_model::AutomationMode::Write
         && let Some(l) = t.lane(&AutoParam::Volume)
         && !l.points.is_empty()
     {

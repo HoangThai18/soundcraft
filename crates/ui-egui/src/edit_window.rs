@@ -42,8 +42,11 @@ pub fn sample_at(s: &Session, tl: Rect, x: f32) -> Samples {
     s.edit.zoom.scroll + soundcraft_time::to_samples(f64::from(x - tl.min.x) * s.edit.zoom.samples_per_px)
 }
 
+pub const LANE_H: f32 = 46.0;
+
 pub fn track_height(t: &Track) -> f32 {
-    t.height.points()
+    let alt = if t.view == "playlists" { t.playlists.len().saturating_sub(1) as f32 * LANE_H } else { 0.0 };
+    t.height.points() + alt
 }
 
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
@@ -59,6 +62,9 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             .frame(egui::Frame::NONE.fill(t.panel_bg))
             .show(ui, |ui| crate::midi_editor::show(app, ui));
     }
+    if app.ui.show_universe {
+        egui::Panel::top("universe").exact_size(64.0).frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 18, 19))).show(ui, |ui| universe(app, ui));
+    }
     if app.ui.show_tracks_list {
         egui::Panel::left("tracks_list")
             .exact_size(168.0)
@@ -69,6 +75,45 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         egui::Panel::right("clip_list").exact_size(230.0).frame(egui::Frame::NONE.fill(t.panel_bg)).show(ui, |ui| panels::clip_list(app, ui));
     }
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.window_bg)).show(ui, |ui| main_area(app, ui));
+}
+
+/// Universe: the whole session in miniature; the box is the visible area (drag or click to move).
+fn universe(app: &mut SoundApp, ui: &mut Ui) {
+    let r = ui.max_rect().shrink2(vec2(8.0, 4.0));
+    let s = app.engine.session();
+    let total = (s.content_end() + s.sample_rate.samples(10.0)).max(1) as f32;
+    let tracks: Vec<&Track> = s.tracks.iter().filter(|t| !t.hidden).collect();
+    let n = tracks.len().max(1) as f32;
+    let rh = (r.height() / n).max(1.0);
+    for (i, t) in tracks.iter().enumerate() {
+        let y = r.min.y + i as f32 * rh;
+        for c in t.clips() {
+            let x0 = r.min.x + c.start as f32 / total * r.width();
+            let x1 = r.min.x + c.end() as f32 / total * r.width();
+            ui.painter().rect_filled(
+                Rect::from_min_max(pos2(x0, y + 0.5), pos2(x1.max(x0 + 1.0), y + rh - 0.5)),
+                0.0,
+                rgb(c.color.unwrap_or(t.color)),
+            );
+        }
+    }
+    let vis0 = s.edit.zoom.scroll as f32 / total;
+    let tlw = app.edit_layout.timeline[2] - app.edit_layout.timeline[0];
+    let vis1 = vis0 + (f64::from(tlw.max(100.0)) * s.edit.zoom.samples_per_px) as f32 / total;
+    let vr = Rect::from_min_max(pos2(r.min.x + vis0 * r.width(), r.min.y - 2.0), pos2(r.min.x + vis1.min(1.0) * r.width(), r.max.y + 2.0));
+    ui.painter().rect_stroke(vr, 2.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Outside);
+    if app.is_playing() {
+        let x = r.min.x + app.position() as f32 / total * r.width();
+        ui.painter().line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, Tokens::DARK.playhead));
+    }
+    let resp = ui.interact(r, ui.id().with("universe"), Sense::click_and_drag());
+    if let Some(p) = resp.interact_pointer_pos()
+        && (resp.clicked() || resp.dragged())
+    {
+        let half = (vis1 - vis0) * 0.5;
+        let k = ((p.x - r.min.x) / r.width() - half).clamp(0.0, 1.0);
+        let _ = app.engine.execute("view.scroll", &json!({"to": (k * total) as i64}));
+    }
 }
 
 fn dock_tabs(app: &mut SoundApp, ui: &mut Ui) {
@@ -114,7 +159,7 @@ fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
     ui.painter().text(
         pos2(r.max.x - 10.0, r.center().y),
         Align2::RIGHT_CENTER,
-        format!("{undo}   {:.1} ms/frame", app.frame_ms),
+        if app.frame_ms < 50.0 { format!("{undo}   {:.1} ms/frame", app.frame_ms) } else { undo },
         regular(11.0),
         t.text_dim,
     );
@@ -475,7 +520,8 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
         let cr = Rect::from_min_size(pos2(head.max.x + i as f32 * COLUMN_W, row.min.y), vec2(COLUMN_W, row.height()));
         header_column(app, ui, &track, c, cr);
     }
-    let lane = Rect::from_min_max(pos2(tl.min.x, row.min.y), pos2(tl.max.x, row.max.y));
+    let main_h = track.height.points();
+    let lane = Rect::from_min_max(pos2(tl.min.x, row.min.y), pos2(tl.max.x, row.min.y + main_h));
     // Header background.
     ui.painter().rect_filled(head, 0.0, if selected { Color32::from_rgb(52, 58, 66) } else { t.panel_bg2 });
     ui.painter().rect_filled(Rect::from_min_size(head.min, vec2(5.0, head.height())), 0.0, rgb(track.color));
@@ -511,6 +557,48 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
         }
     }
     lane_interaction(app, ui, &track, lane, tl);
+    if track.view == "playlists" {
+        playlist_lanes(app, ui, &track, row, main_h, tl);
+    }
+}
+
+/// Alternate playlists as lanes under the main one; clicking a clip promotes it (comping).
+fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, main_h: f32, tl: Rect) {
+    let t = Tokens::DARK;
+    let s = app.engine.session().clone();
+    let mut y = row.min.y + main_h;
+    for (i, pl) in track.playlists.iter().enumerate() {
+        if i == track.active_playlist {
+            continue;
+        }
+        let lane = Rect::from_min_max(pos2(tl.min.x, y), pos2(tl.max.x, y + LANE_H));
+        let head = Rect::from_min_max(pos2(row.min.x + 12.0, y), pos2(tl.min.x, y + LANE_H));
+        ui.painter().rect_filled(lane, 0.0, Color32::from_rgb(30, 30, 31));
+        ui.painter().text(pos2(head.min.x + 4.0, head.center().y), Align2::LEFT_CENTER, &pl.name, regular(10.5), t.text_dim);
+        let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
+        for c in &pl.clips {
+            let r = Rect::from_min_max(pos2(x_of(&s, tl, c.start), lane.min.y + 3.0), pos2(x_of(&s, tl, c.end()), lane.max.y - 3.0));
+            painter.rect(r, 2.0, rgb(track.color).gamma_multiply(0.45), Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
+            painter.text(pos2(r.min.x + 4.0, r.min.y + 7.0), Align2::LEFT_CENTER, &c.name, regular(9.5), t.text);
+        }
+        let resp = ui.interact(lane, ui.id().with(("pl_lane", track.id.0, i)), Sense::click());
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            let at = sample_at(&s, tl, p.x);
+            let sel = s.edit.selection;
+            let range = if !sel.is_empty() && sel.contains(at) {
+                Some((sel.start, sel.end))
+            } else {
+                pl.clips.iter().find(|c| c.range().contains(at)).map(|c| (c.start, c.end()))
+            };
+            if let Some((a, b)) = range {
+                let _ = app.run("track.playlist_promote", json!({"track": track.id.0, "playlist": i, "start": a, "end": b}));
+            }
+        }
+        resp.on_hover_text("Click a take (or the selection) to promote it to the main playlist");
+        y += LANE_H;
+    }
 }
 
 fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, selected: bool) {
@@ -735,7 +823,8 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
             let mut c = track.comments.clone();
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(3.0)));
             if child.add(egui::TextEdit::multiline(&mut c).desired_width(r.width() - 6.0).font(regular(10.0))).changed() {
-                let _ = app.run("track.comments", json!({"track": track.id.0, "comments": c}));
+                let _ =
+                    app.engine.execute_merged("track.comments", &json!({"track": track.id.0, "comments": c}), &format!("comments:{}", track.id.0));
             }
         }
     }
@@ -754,7 +843,7 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
     if track.kind.is_midi() {
         opts.extend(["notes", "regions", "blocks"]);
     } else if track.kind.has_playlist() {
-        opts.extend(["waveform", "blocks", "clip_gain"]);
+        opts.extend(["waveform", "blocks", "clip_gain", "playlists"]);
     }
     opts.extend(["volume", "pan", "mute"]);
     for o in opts {
@@ -1127,7 +1216,32 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         ui.ctx().set_cursor_icon(icon);
     }
     let auto_view = AutoParam::parse(&track.view);
-    if resp.drag_started() {
+    let fade_corner = if tool == Tool::Smart {
+        hit.as_ref().and_then(|c| {
+            let xs = x_of(&s, tl, c.start);
+            let xe = x_of(&s, tl, c.end());
+            let top = p.y < lane.min.y + lane.height() * 0.28;
+            if !top {
+                None
+            } else if (p.x - xs) > 0.0 && (p.x - xs) < 14.0 {
+                Some(true)
+            } else if (xe - p.x) > 0.0 && (xe - p.x) < 14.0 {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    if fade_corner.is_some() && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
+    if resp.drag_started()
+        && let (Some(fade_in), Some(c)) = (fade_corner, hit.as_ref())
+    {
+        app.gesture = Some(Gesture::Fade { clip: c.id, track: track.id, fade_in, to: at });
+    } else if resp.drag_started() {
         app.gesture = match eff {
             Tool::Selector | Tool::Smart => Some(Gesture::Select { track: track.id, anchor: snap(&s, at), tracks: vec![track.id] }),
             Tool::Grabber => hit.as_ref().map(|c| {
@@ -1172,6 +1286,7 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
                 }
             }
             Some(Gesture::TrimStart { to, .. } | Gesture::TrimEnd { to, .. }) => *to = snap(&s, at),
+            Some(Gesture::Fade { to, .. }) => *to = at,
             Some(Gesture::Scrub { last }) => {
                 *last = at;
                 let _ = app.engine.execute("transport.locate", &json!({"at": at}));
@@ -1213,6 +1328,12 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
                 }
                 if delta != 0 || to_track != from_track {
                     let _ = app.run("edit.move_clips", params);
+                }
+            }
+            Some(Gesture::Fade { clip, track, fade_in, to }) => {
+                if let Some((_, c)) = app.engine.session().find_clip(clip).map(|(t, c)| (t, c.clone())) {
+                    let (a, b) = if fade_in { (c.start, to.clamp(c.start + 1, c.end())) } else { (to.clamp(c.start, c.end() - 1), c.end()) };
+                    let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": a, "end": b, "shape": "s-curve"}));
                 }
             }
             Some(Gesture::TrimStart { clip, track, to }) => trim_clip(app, clip, track, to, true),
@@ -1402,6 +1523,16 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
     {
         let x = x_of(s, tl, *to);
         painter.line_segment([pos2(x, r[1]), pos2(x, r[3])], Stroke::new(2.0, Color32::WHITE));
+    }
+    if let Some(Gesture::Fade { clip, fade_in, to, .. }) = &app.gesture
+        && let Some((tid, c)) = s.find_clip(*clip)
+        && let Some((_, r)) = app.edit_layout.rows.iter().find(|(i, _)| *i == tid.0)
+    {
+        let (a, b) = if *fade_in { (c.start, *to) } else { (*to, c.end()) };
+        let (x0, x1) = (x_of(s, tl, a), x_of(s, tl, b));
+        let (y0, y1) = (r[1] + 2.0, r[3] - 2.0);
+        let line = if *fade_in { [pos2(x0, y1), pos2(x1, y0)] } else { [pos2(x0, y0), pos2(x1, y1)] };
+        painter.line_segment(line, Stroke::new(2.0, Color32::WHITE));
     }
     if let Some(at) = scroll_to {
         let _ = app.engine.execute("view.scroll", &json!({"to": at}));

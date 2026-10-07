@@ -126,6 +126,58 @@ pub fn specs() -> Vec<CommandSpec> {
             tr.folder_open = v.unwrap_or(!tr.folder_open);
             Ok(json!({"open": tr.folder_open}))
         }),
+        cmd!("track.vca", "Assign to VCA", [], None, "{tracks?, vca: VCA track id|name | null}", has_selection, |e, p| {
+            let tracks = tracks_required(e, "track.vca", p)?;
+            let vca = track_param(e, "track.vca", p, "vca")?;
+            if let Some(v) = vca
+                && e.session().track(v).is_none_or(|t| t.kind != TrackKind::Vca)
+            {
+                return Err(bad("track.vca", "`vca` must be a VCA Master track"));
+            }
+            let s = e.session_mut();
+            for t in &tracks {
+                if let Some(tr) = s.track_mut(*t) {
+                    tr.mixer.vca = vca.map(|v| v.0);
+                }
+            }
+            Ok(json!({"vca": vca}))
+        }),
+        cmd!(
+            "track.playlist_promote",
+            "Promote to Main Playlist",
+            [],
+            None,
+            "{track, playlist: index, start?, end?} (copy that range from an alternate playlist into the active one)",
+            has_tracks,
+            |e, p| {
+                let t = track_param(e, "track.playlist_promote", p, "track")?.ok_or_else(|| bad("track.playlist_promote", "`track` required"))?;
+                let idx =
+                    p.get("playlist").and_then(Value::as_u64).ok_or_else(|| bad("track.playlist_promote", "`playlist` index required"))? as usize;
+                let r = range_param(e, "track.playlist_promote", p)?;
+                if r.is_empty() {
+                    return Err(bad("track.playlist_promote", "give `start` and `end`"));
+                }
+                let s = e.session_mut();
+                let (src, active) = {
+                    let tr = s.track(t).ok_or_else(|| bad("track.playlist_promote", "no track"))?;
+                    (tr.playlists.get(idx).cloned().ok_or_else(|| bad("track.playlist_promote", "no such playlist"))?, tr.active_playlist)
+                };
+                if idx == active {
+                    return Err(bad("track.playlist_promote", "that playlist is already active"));
+                }
+                // Copy the clips of the source playlist inside the range (via a temporary active switch).
+                if let Some(tr) = s.track_mut(t) {
+                    tr.active_playlist = idx;
+                }
+                let clips = crate::edit::copy_range(s, t, r);
+                if let Some(tr) = s.track_mut(t) {
+                    tr.active_playlist = active;
+                }
+                let _ = src;
+                let ids = crate::edit::paste(s, t, r.start, &clips, r.len(), false);
+                Ok(json!({"clips": ids}))
+            }
+        ),
         cmd!("track.input", "Track Input", [], None, "{tracks?, input: none|bus name|hardware name}", has_selection, |e, p| route(e, p, true)),
         cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name}", has_selection, |e, p| route(e, p, false)),
         cmd!("track.timebase", "Track Timebase", [], None, "{tracks?, ticks: bool}", has_selection, |e, p| flag(
@@ -344,12 +396,21 @@ fn move_to_folder(e: &mut Engine, p: &Value) -> Result<Value> {
         let f = s.tracks.remove(i);
         s.tracks.insert(first_idx.min(s.tracks.len()), f);
     }
+    // A routing folder sums its members through its own bus.
+    let fname = s.track(fid).map(|x| x.name.clone()).unwrap_or_else(|| "Folder".into());
+    let bus = s.add_bus(&format!("{fname} Bus"), ChannelFormat::Stereo);
+    if let Some(f) = s.track_mut(fid) {
+        f.mixer.input = Route::Bus(bus);
+    }
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
             tr.folder = Some(fid);
+            if tr.mixer.output == Route::Main {
+                tr.mixer.output = Route::Bus(bus);
+            }
         }
     }
-    Ok(json!({"folder": fid}))
+    Ok(json!({"folder": fid, "bus": bus}))
 }
 
 fn change_width(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -437,7 +498,8 @@ fn height(e: &mut Engine, p: &Value) -> Result<Value> {
 fn view(e: &mut Engine, p: &Value) -> Result<Value> {
     let tracks = tracks_required(e, "track.view", p)?;
     let v = str_param(p, "view").ok_or_else(|| bad("track.view", "`view` required"))?.to_string();
-    let ok = matches!(v.as_str(), "waveform" | "blocks" | "notes" | "regions" | "clip_gain") || soundcraft_model::AutoParam::parse(&v).is_some();
+    let ok = matches!(v.as_str(), "waveform" | "blocks" | "notes" | "regions" | "clip_gain" | "playlists")
+        || soundcraft_model::AutoParam::parse(&v).is_some();
     if !ok {
         return Err(bad("track.view", format!("unknown view `{v}`")));
     }
@@ -586,4 +648,36 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
         }
     }
     Ok(json!({key: r}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comp_from_alternate_playlist() {
+        let mut e = crate::demo::demo_engine();
+        let kick = e.session().track_by_name("Kick").map(|t| t.id.0).unwrap();
+        // Duplicate the playlist, then clear a range on the new active playlist and promote it back from the first.
+        e.execute("track.playlist_duplicate", &json!({"track": kick})).unwrap();
+        e.execute("edit.clear", &json!({"tracks": [kick], "start": {"seconds": 10.0}, "end": {"seconds": 12.0}})).unwrap();
+        let gap = |e: &Engine| {
+            e.session().track(soundcraft_model::TrackId(kick)).unwrap().playlist().unwrap().clip_at(e.session().sample_rate.samples(11.0)).is_none()
+        };
+        assert!(gap(&e));
+        e.execute("track.playlist_promote", &json!({"track": kick, "playlist": 0, "start": {"seconds": 10.0}, "end": {"seconds": 12.0}})).unwrap();
+        assert!(!gap(&e));
+        assert!(e.execute("track.playlist_promote", &json!({"track": kick, "playlist": 1, "start": 0, "end": 10})).is_err());
+    }
+
+    #[test]
+    fn folder_routes_members_through_its_bus() {
+        let mut e = crate::demo::demo_engine();
+        let r = e.execute("track.move_to_new_folder", &json!({"tracks": ["Kick", "Snare"], "name": "Drums"})).unwrap();
+        assert!(r["bus"].is_u64());
+        let s = e.session();
+        let kick = s.track_by_name("Kick").unwrap();
+        assert!(matches!(kick.mixer.output, Route::Bus(_)));
+        assert!(s.tracks.iter().any(|t| t.kind == TrackKind::Folder && t.mixer.input == kick.mixer.output));
+    }
 }

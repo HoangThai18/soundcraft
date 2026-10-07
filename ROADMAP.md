@@ -8,7 +8,7 @@ the honest status: what works today, what is missing, and how far we are.
 
 | Measure | Value | How |
 |---|---|---|
-| Menu-catalog parity (engine + UI) | see [`docs/parity.md`](docs/parity.md) | `cargo xtask parity` compares the incumbent's 512 menu leaves (names observed black-box) with our command registry |
+| Menu-catalog parity (engine + UI) | **462 / 512 menu items (90 %)**; engine alone 388 / 512 (76 %), see [`docs/parity.md`](docs/parity.md) | `cargo xtask parity` compares the incumbent's 512 menu leaves (names observed black-box) with our command registry; the remaining items are mostly video, Atmos, collaboration, notation and third-party services |
 | Estimated overall feature parity | **~40 %** | judgement across the areas below, weighted by how much professional users rely on them |
 | Estimated remaining effort | **~220–300 wall-clock hours** of Claude Opus 5.5 work (single agent; roughly 70–100 hours with 3–4 agents in parallel) | sum of the per-area estimates below |
 
@@ -33,9 +33,9 @@ the honest status: what works today, what is missing, and how far we are.
 
 ## Current focus
 
-1. Land the engine parity batch (Edit/View/Track/Clip/Event/Options/Setup menu items).
-2. Automation write modes during playback (touch/latch/write from fader moves).
-3. Loop record and QuickPunch; input monitoring.
+1. Play back the model-only state the engine already stores: clip effects, trim automation, MIDI real-time properties.
+2. QuickPunch and input monitoring (loop record and Write/Touch/Latch automation passes have landed).
+3. Pitch-preserving realtime Elastic Audio.
 4. Plugin hosting (CLAP first, it is MIT-licensed and Rust-friendly).
 5. Elastic Audio in realtime; Beat Detective workflow window.
 6. README screenshots and the first alpha release.

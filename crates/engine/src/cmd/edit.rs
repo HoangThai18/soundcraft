@@ -47,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             repeat_to_fill
         ),
         cmd!(noundo "edit.select_all", "Select All", ["Edit"], Some("Cmd+A"), "{}", always, select_all),
-        cmd!(noundo "edit.select", "Set Edit Selection", [], None, "{tracks?: [id|name], start?, end?, clips?: [id]}", always, select),
+        cmd!(noundo "edit.select", "Set Edit Selection", [], None, "{tracks?: [id|name], start?, end?, clips?: [id], exact?: bool (ignore edit groups)}", always, select),
         cmd!(noundo "edit.select_none", "Deselect All", [], None, "{}", always, |e, _| {
             let s = e.session_mut();
             s.edit.selected_tracks.clear();
@@ -336,8 +336,21 @@ fn select(e: &mut Engine, p: &Value) -> Result<Value> {
     let en = position_param(e, "edit.select", p, "end")?;
     let clips =
         p.get("clips").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(soundcraft_model::ClipId).collect::<Vec<_>>());
+    let exact = bool_or(p, "exact", false);
     let s = e.session_mut();
-    if let Some(t) = tracks {
+    if let Some(mut t) = tracks {
+        // Active edit groups select all their members together.
+        if !exact {
+            let extra: Vec<soundcraft_model::TrackId> =
+                s.groups.iter().filter(|g| g.active && g.edit && g.members.iter().any(|m| t.contains(m))).flat_map(|g| g.members.clone()).collect();
+            for m in extra {
+                if !t.contains(&m) {
+                    t.push(m);
+                }
+            }
+            let order: Vec<soundcraft_model::TrackId> = s.tracks.iter().map(|x| x.id).collect();
+            t.sort_by_key(|x| order.iter().position(|o| o == x).unwrap_or(usize::MAX));
+        }
         s.edit.selected_tracks = t;
     }
     match (st, en) {

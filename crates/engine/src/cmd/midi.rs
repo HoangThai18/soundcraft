@@ -10,7 +10,15 @@ use soundcraft_time::TICKS_PER_QUARTER;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "midi.notes", "List MIDI Notes", [], None, "{clip}", always, notes),
-        cmd!("midi.new_clip", "New MIDI Clip", [], None, "{track, start?, end?|length?} (default: the edit selection, or 1 bar)", has_tracks, new_clip),
+        cmd!(
+            "midi.new_clip",
+            "New MIDI Clip",
+            [],
+            None,
+            "{track, start?, end?|length?} (default: the edit selection, or 1 bar)",
+            has_tracks,
+            new_clip
+        ),
         cmd!("midi.note_add", "Add Note", [], None, "{clip, pitch, start_ticks, length_ticks?: 480, velocity?: 100, channel?: 0}", always, note_add),
         cmd!("midi.note_edit", "Edit Note", [], None, "{clip, index, pitch?, start_ticks?, length_ticks?, velocity?}", always, note_edit),
         cmd!("midi.note_delete", "Delete Notes", [], None, "{clip, indices: [n]}", always, note_delete),

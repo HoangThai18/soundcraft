@@ -11,7 +11,8 @@ fn root() -> PathBuf {
 }
 
 fn cargo(args: &[&str]) -> Result<(), String> {
-    let st = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())).args(args).current_dir(root()).status().map_err(|e| e.to_string())?;
+    let st =
+        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())).args(args).current_dir(root()).status().map_err(|e| e.to_string())?;
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
 }
 
@@ -34,7 +35,8 @@ const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "egui_kittest", "rfd", "
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "xtask"];
 
 fn layers() -> Result<(), String> {
-    let out = Command::new("cargo").args(["metadata", "--format-version", "1", "--no-deps"]).current_dir(root()).output().map_err(|e| e.to_string())?;
+    let out =
+        Command::new("cargo").args(["metadata", "--format-version", "1", "--no-deps"]).current_dir(root()).output().map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
     let mut problems = Vec::new();
     for p in v["packages"].as_array().cloned().unwrap_or_default() {
@@ -74,10 +76,15 @@ fn layers() -> Result<(), String> {
     }
 }
 
-const ASSET_EXT: &[&str] = &["png", "jpg", "jpeg", "svg", "ico", "icns", "ttf", "otf", "ttc", "woff", "woff2", "wav", "aif", "aiff", "flac", "mp3", "ogg", "gif", "webp"];
+const ASSET_EXT: &[&str] =
+    &["png", "jpg", "jpeg", "svg", "ico", "icns", "ttf", "otf", "ttc", "woff", "woff2", "wav", "aif", "aiff", "flac", "mp3", "ogg", "gif", "webp"];
 
 fn assets() -> Result<(), String> {
-    let out = Command::new("git").args(["ls-files", "--cached", "--others", "--exclude-standard"]).current_dir(root()).output().map_err(|e| e.to_string())?;
+    let out = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(root())
+        .output()
+        .map_err(|e| e.to_string())?;
     let files = String::from_utf8_lossy(&out.stdout).to_string();
     let attribution = std::fs::read_to_string(root().join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
     let mut missing = Vec::new();
@@ -87,7 +94,8 @@ fn assets() -> Result<(), String> {
             continue;
         }
         // Generated icon trees are covered by their directory row.
-        let covered = attribution.contains(&format!("`{f}`")) || Path::new(f).ancestors().skip(1).any(|a| !a.as_os_str().is_empty() && attribution.contains(&format!("`{}/`", a.display())));
+        let covered = attribution.contains(&format!("`{f}`"))
+            || Path::new(f).ancestors().skip(1).any(|a| !a.as_os_str().is_empty() && attribution.contains(&format!("`{}/`", a.display())));
         if !covered {
             missing.push(f.to_string());
         }
@@ -105,7 +113,18 @@ fn parity() -> Result<(), String> {
 }
 
 /// Crates that must compile for the web.
-const WASM: &[&str] = &["soundcraft-time", "soundcraft-audio-io", "soundcraft-midi", "soundcraft-dsp", "soundcraft-model", "soundcraft-mix", "soundcraft-engine", "soundcraft-playback", "soundcraft-automation", "soundcraft-ui-egui"];
+const WASM: &[&str] = &[
+    "soundcraft-time",
+    "soundcraft-audio-io",
+    "soundcraft-midi",
+    "soundcraft-dsp",
+    "soundcraft-model",
+    "soundcraft-mix",
+    "soundcraft-engine",
+    "soundcraft-playback",
+    "soundcraft-automation",
+    "soundcraft-ui-egui",
+];
 
 fn wasm() -> Result<(), String> {
     let mut args = vec!["check", "--target", "wasm32-unknown-unknown"];

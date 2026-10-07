@@ -314,11 +314,11 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
 
 /// Menu-style invocation: may open a dialog.
 pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
-    if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path) {
-        if w.starts_with("window.") {
-            let _ = app.run(w, json!({"value": true}));
-            return;
-        }
+    if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path)
+        && w.starts_with("window.")
+    {
+        let _ = app.run(w, json!({"value": true}));
+        return;
     }
     if id == "audiosuite.process" {
         let p = params_for(path, id);

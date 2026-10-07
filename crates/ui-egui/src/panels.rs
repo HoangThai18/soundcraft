@@ -254,6 +254,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
             .id(egui::Id::new(("plugin", tid.0, slot)))
             .open(&mut open)
             .default_width(340.0)
+            .default_pos(egui::pos2(ctx.content_rect().width() - 380.0, 120.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&ins.preset).color(Tokens::DARK.text_dim));
@@ -289,7 +290,11 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                             ui.add(sl)
                         };
                         if (x - v).abs() > f32::EPSILON {
-                            let _ = app.engine.execute("mix.insert_param", &json!({"track": tid.0, "slot": slot, "param": p.id, "value": x}));
+                            let _ = app.engine.execute_merged(
+                                "mix.insert_param",
+                                &json!({"track": tid.0, "slot": slot, "param": p.id, "value": x}),
+                                &format!("param:{}:{slot}:{}", tid.0, p.id),
+                            );
                         }
                         let _ = resp;
                         ui.label(egui::RichText::new(p.format(x)).font(mono(11.0)));

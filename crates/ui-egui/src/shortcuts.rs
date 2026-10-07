@@ -127,6 +127,16 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
             let s = app.engine.session();
             let at = s.edit.selection.start;
             let back = m.alt;
+            if s.edit.tab_to_transient
+                && !back
+                && let Some(t) = s.edit.selected_tracks.first().copied()
+            {
+                let r = soundcraft_time::Range::new(at + 1, s.content_end());
+                if let Some(n) = soundcraft_engine::io::transients_in(s, t, r, 0.5).into_iter().find(|x| *x > at + 64) {
+                    let _ = app.run("transport.locate", json!({"at": n}));
+                    return true;
+                }
+            }
             let mut edges: Vec<i64> = s
                 .tracks
                 .iter()

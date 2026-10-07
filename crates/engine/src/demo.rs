@@ -32,7 +32,7 @@ fn insert(id: &str) -> Insert {
 }
 
 fn beat_len(sr: f64) -> usize {
-    (sr * 60.0 / BPM) as usize
+    (sr * 60.0 / BPM).round() as usize
 }
 
 fn kick(sr: f64, frames: usize, out: &mut [f32], at: usize, vel: f32) {
@@ -308,8 +308,9 @@ pub fn demo_session() -> Session {
         tr.mixer.inserts[0] = Some(insert("maximizer"));
     }
     // Markers.
-    for (name, at) in [("Intro", 0usize), ("Verse", 4), ("Chorus", 12), ("Outro", 20)] {
-        s.add_marker(name, MarkerKind::Marker, (at * bar) as i64, (at * bar) as i64);
+    for (name, at) in [("Intro", 1i64), ("Verse", 5), ("Chorus", 13), ("Outro", 21)] {
+        let pos = s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: at, beat: 1, tick: 0 }, sr);
+        s.add_marker(name, MarkerKind::Marker, pos, pos);
     }
     s.edit.selected_tracks = vec![tk];
     s.edit.selection = soundcraft_time::Range::point((4 * bar) as i64);

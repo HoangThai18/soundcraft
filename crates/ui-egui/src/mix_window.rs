@@ -116,7 +116,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         let mut c = track.comments.clone();
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sec));
         if child.add(egui::TextEdit::multiline(&mut c).desired_width(inner_w).desired_rows(2).hint_text("comments").font(regular(10.0))).changed() {
-            let _ = app.engine.execute("track.comments", &json!({"track": id.0, "comments": c}));
+            let _ = app.engine.execute_merged("track.comments", &json!({"track": id.0, "comments": c}), &format!("comments:{}", id.0));
         }
         y = sec.max.y + 4.0;
     }
@@ -174,11 +174,9 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
             let before = v;
             let resp = pan_knob(&mut c, ks, &mut v, "Pan (drag; double-click centres)");
             if (v - before).abs() > f32::EPSILON {
-                let _ = app.engine.execute("mix.pan", &json!({"track": id.0, "pan": v, "index": i}));
+                let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": v, "index": i}), &format!("pan:{}:{i}", id.0));
             }
-            if resp.drag_stopped() {
-                app.engine.push_undo("Pan", app.engine.session_arc());
-            }
+            let _ = resp;
             let pr = Rect::from_center_size(pos2(cx, y + ks + 8.0), vec2(ks + 8.0, 13.0));
             ui.painter().rect_filled(pr, 1.0, t.counter_bg);
             ui.painter().text(pr.center(), Align2::CENTER_CENTER, pan_text(v), regular(10.0), t.counter_text);
@@ -218,25 +216,8 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let fh = (r.max.y - bottom_h - y).max(120.0);
     let fr = Rect::from_min_size(pos2(x0, y), vec2(inner_w * 0.6, fh));
     if let Some(db) = fader(ui, fr, track.mixer.volume_db, ui.id().with(("fader", id.0))) {
-        if app.gesture.is_none() {
-            app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db });
-            app.ui.status = String::new();
-        }
-        let before = app.engine.session_arc();
-        let _ = app.engine.execute("mix.volume", &json!({"track": id.0, "db": db}));
-        let _ = before;
-    }
-    if !ui.input(|i| i.pointer.any_down())
-        && let Some(crate::Gesture::Fader { track: ft, start_db }) = app.gesture.clone()
-        && ft == id
-    {
-        app.gesture = None;
-        // Collapse the drag into a single undo step.
-        let end = app.engine.session().track(id).map_or(start_db, |t| t.mixer.volume_db);
-        if (end - start_db).abs() > 0.001 {
-            let _ = app.engine.execute("mix.volume", &json!({"track": id.0, "db": start_db}));
-            let _ = app.run("mix.volume", json!({"track": id.0, "db": end}));
-        }
+        app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db });
+        let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
     }
     let md = app.meters.get(&id).copied().unwrap_or_default();
     let mr = Rect::from_min_max(pos2(fr.max.x + 4.0, fr.min.y + 6.0), pos2(x0 + inner_w - 2.0, fr.max.y - 6.0));
@@ -371,7 +352,8 @@ fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rec
             );
             if resp.dragged() {
                 let db = (s.level_db.max(-60.0) - resp.drag_delta().y * 0.3).clamp(-144.0, 12.0);
-                let _ = app.engine.execute("mix.send_level", &json!({"track": id.0, "slot": slot, "db": db}));
+                let _ =
+                    app.engine.execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", id.0));
             }
             if resp.double_clicked() {
                 let _ = app.run("mix.send_level", json!({"track": id.0, "slot": slot, "db": 0.0}));
