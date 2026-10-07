@@ -46,6 +46,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.arrange_cascade", "Cascade", "Window > Arrange > Cascade", None),
     ("window.midi_front", "MIDI Editors to Front", "Window > MIDI Editors > Bring to Front", None),
     ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
+    ("window.clip_effects", "Clip Effects", "Window > Clip Effects", None),
+    ("window.clip_effects_dock", "Clip Effects", "View > Other Displays > Lower Dock > Clip Effects", None),
     ("window.playback_engine", "Playback Engine", "", None),
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
@@ -371,6 +373,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             json!({})
         }
         "window.automation" => toggle(&mut app.ui.show_automation),
+        "window.clip_effects" | "window.clip_effects_dock" => toggle(&mut app.ui.show_clip_effects),
         "window.playback_engine" => toggle(&mut app.ui.show_playback_engine),
         "window.io_setup" => toggle(&mut app.ui.show_io_setup),
         "window.shortcuts" => toggle(&mut app.ui.show_shortcuts),

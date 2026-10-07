@@ -42,6 +42,19 @@ struct Strip {
     held: Vec<u8>,
     muted: bool,
     gr: f32,
+    /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
+    clip_fx: HashMap<u64, ClipFx>,
+    clipbuf: Vec<Vec<f32>>,
+}
+
+/// Clip Effects: an EQ and a compressor per clip, configured from `edit.values`
+/// (`clip_fx.<clip>.eq.<param>`, `clip_fx.<clip>.comp.<param>`, `clip_fx.<clip>.gain`).
+struct ClipFx {
+    eq: Option<Box<dyn Plugin>>,
+    comp: Option<Box<dyn Plugin>>,
+    gain_db: f32,
+    sr: f32,
+    ch: usize,
 }
 
 impl Strip {
@@ -55,6 +68,8 @@ impl Strip {
             held: Vec::new(),
             muted: false,
             gr: 0.0,
+            clip_fx: HashMap::new(),
+            clipbuf: Vec::new(),
         }
     }
 }
@@ -310,11 +325,32 @@ fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &HashMap<Bus
     }
     match t.kind {
         TrackKind::Audio => {
+            let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
             for clip in t.clips() {
-                if clip.muted || !clip.is_audio() {
+                if clip.muted || !clip.is_audio() || !clip.range().overlaps(&block) {
                     continue;
                 }
-                render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch);
+                match clip_fx_params(s, clip.id.0) {
+                    None => render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch),
+                    Some(params) => {
+                        let nch = strip.buf.len();
+                        if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
+                            strip.clipbuf = vec![vec![0.0; frames.max(strip.scratch.len())]; nch];
+                        }
+                        for c in strip.clipbuf.iter_mut() {
+                            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+                        }
+                        render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
+                        let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
+                        fx.configure(&params);
+                        fx.process(&mut strip.clipbuf, frames);
+                        for (d, c) in strip.buf.iter_mut().zip(strip.clipbuf.iter()) {
+                            for (x, y) in d.iter_mut().zip(c.iter()).take(frames) {
+                                *x += *y;
+                            }
+                        }
+                    }
+                }
             }
         }
         TrackKind::Aux | TrackKind::Folder => {
@@ -388,6 +424,16 @@ fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &HashMap<Bus
     }
     let mut v0 = volume_db_at(t, pos);
     let mut v1 = volume_db_at(t, pos + frames as i64);
+    // Trim automation (an offset on top of the volume curve).
+    if let Some(l) = t
+        .automation
+        .iter()
+        .find(|l| matches!(&l.param, AutoParam::Plugin { slot: u8::MAX, param } if param == "trim"))
+        .filter(|l| !l.points.is_empty())
+    {
+        v0 += l.value_at(pos, 0.0);
+        v1 += l.value_at(pos + frames as i64, 0.0);
+    }
     // VCA master: its fader offsets the member's, and its mute mutes the member.
     if let Some(vid) = t.mixer.vca
         && let Some(vca) = s.tracks.iter().find(|x| x.id.0 == vid && x.kind == TrackKind::Vca)
@@ -403,6 +449,81 @@ fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &HashMap<Bus
         for i in 0..frames {
             if let Some(x) = c.get_mut(i) {
                 *x *= lerp_gain(g0, g1, i, frames);
+            }
+        }
+    }
+}
+
+/// Clip-effect parameters of a clip, or None when it has none or they are bypassed.
+fn clip_fx_params(s: &Session, clip: u64) -> Option<Vec<(String, f32)>> {
+    if s.edit.values.is_empty() {
+        return None;
+    }
+    let pre = format!("clip_fx.{clip}.");
+    let v: Vec<(String, f32)> = s
+        .edit
+        .values
+        .range(pre.clone()..)
+        .take_while(|(k, _)| k.starts_with(&pre))
+        .map(|(k, v)| (k.get(pre.len()..).unwrap_or("").to_string(), *v as f32))
+        .collect();
+    if v.is_empty() || s.edit.flag(&format!("clip_fx.bypass.{clip}")) { None } else { Some(v) }
+}
+
+impl ClipFx {
+    fn new(sr: f32, ch: usize) -> ClipFx {
+        ClipFx { eq: None, comp: None, gain_db: 0.0, sr, ch }
+    }
+    fn make(&self, id: &str) -> Option<Box<dyn Plugin>> {
+        soundcraft_dsp::create(id).map(|mut p| {
+            p.prepare(self.sr, 16_384, self.ch.max(1));
+            p
+        })
+    }
+    /// Modules exist only when one of their parameters is set.
+    fn configure(&mut self, params: &[(String, f32)]) {
+        self.gain_db = 0.0;
+        let has_eq = params.iter().any(|(k, _)| k.starts_with("eq."));
+        let has_comp = params.iter().any(|(k, _)| k.starts_with("comp."));
+        if has_eq && self.eq.is_none() {
+            self.eq = self.make("eq_7band");
+        } else if !has_eq {
+            self.eq = None;
+        }
+        if has_comp && self.comp.is_none() {
+            self.comp = self.make("compressor");
+        } else if !has_comp {
+            self.comp = None;
+        }
+        for (k, v) in params {
+            if let Some(p) = k.strip_prefix("eq.") {
+                if let Some(eq) = &mut self.eq
+                    && eq.param(p) != Some(*v)
+                {
+                    eq.set_param(p, *v);
+                }
+            } else if let Some(p) = k.strip_prefix("comp.") {
+                if let Some(c) = &mut self.comp
+                    && c.param(p) != Some(*v)
+                {
+                    c.set_param(p, *v);
+                }
+            } else if k == "gain" {
+                self.gain_db = *v;
+            }
+        }
+    }
+    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        if let Some(eq) = &mut self.eq {
+            eq.process(io, frames);
+        }
+        if let Some(c) = &mut self.comp {
+            c.process(io, frames);
+        }
+        if self.gain_db.abs() > 1e-6 {
+            let g = db_to_gain(self.gain_db);
+            for ch in io.iter_mut() {
+                ch.iter_mut().take(frames).for_each(|x| *x *= g);
             }
         }
     }
@@ -562,7 +683,24 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             continue;
         }
         let base = s.tempo.samples_to_ticks(clip.start, sr);
-        for n in &sequence.notes {
+        // MIDI Real-Time Properties (non-destructive velocity/transpose/duration/delay).
+        let rtp = |name: &str, d: f64| s.edit.value(&format!("rtp.{}.{name}", t.id.0), d);
+        let (dv, dp, dur, delay) = if s.edit.values.is_empty() {
+            (0i64, 0i64, 1.0f64, 0i64)
+        } else {
+            (
+                rtp("velocity", 0.0).clamp(-127.0, 127.0) as i64,
+                rtp("transpose", 0.0).clamp(-127.0, 127.0) as i64,
+                rtp("duration", 100.0).clamp(1.0, 1000.0) / 100.0,
+                rtp("delay", 0.0).clamp(-1e7, 1e7) as i64,
+            )
+        };
+        for n0 in &sequence.notes {
+            let mut n = *n0;
+            n.velocity = (i64::from(n.velocity) + dv).clamp(1, 127) as u8;
+            n.pitch = (i64::from(n.pitch) + dp).clamp(0, 127) as u8;
+            n.length = ((n.length as f64 * dur) as i64).max(1);
+            n.start = (n.start + delay).max(0);
             let on = s.tempo.tick_to_samples(base + n.start, sr);
             let off = s.tempo.tick_to_samples(base + n.start + n.length, sr).min(clip.end());
             if on >= clip.end() {
@@ -757,7 +895,29 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
         if c.muted {
             continue;
         }
-        render_clip(s, c, range.start, len, &mut out, &mut scratch);
+        match clip_fx_params(s, c.id.0) {
+            None => render_clip(s, c, range.start, len, &mut out, &mut scratch),
+            Some(params) => {
+                let mut tmp = vec![vec![0.0f32; len]; out.len()];
+                render_clip(s, c, range.start, len, &mut tmp, &mut scratch);
+                let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
+                fx.configure(&params);
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(4096);
+                    let mut block: Vec<Vec<f32>> = tmp.iter().map(|ch| ch.get(done..done + n).map(<[f32]>::to_vec).unwrap_or_default()).collect();
+                    fx.process(&mut block, n);
+                    for (o, b) in out.iter_mut().zip(block.iter()) {
+                        if let Some(dst) = o.get_mut(done..done + n) {
+                            for (x, y) in dst.iter_mut().zip(b.iter()) {
+                                *x += *y;
+                            }
+                        }
+                    }
+                    done += n;
+                }
+            }
+        }
     }
     out
 }
@@ -903,6 +1063,22 @@ mod tests {
         ins.params.insert("gain".into(), -6.0);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
         let _ = render_range(&s, Range::new(0, 4800), 512);
+    }
+
+    #[test]
+    fn clip_effects_gain_and_trim_automation_apply() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let cid = s.track(t).unwrap().clips()[0].id.0;
+        s.edit.values.insert(format!("clip_fx.{cid}.gain"), -6.0);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        let expect = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * db_to_gain(-6.0);
+        assert!((out[0][2000] - expect).abs() < 0.01, "{}", out[0][2000]);
+        s.edit.set_flag(&format!("clip_fx.bypass.{cid}"), true);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert!((out[0][2000] - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
+        s.track_mut(t).unwrap().lane_mut(&AutoParam::Plugin { slot: u8::MAX, param: "trim".into() }).set_point(0, -12.0);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert!(out[0][2000] < 0.2, "{}", out[0][2000]);
     }
 
     #[test]
