@@ -87,6 +87,10 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
             let _ = app.run("transport.record", json!({}));
             true
         }
+        Key::S if m.command && m.ctrl => {
+            let _ = app.run("window.search", json!({}));
+            true
+        }
         Key::Equals if m.command => {
             let _ = app.run("window.toggle_mix_edit", json!({}));
             true

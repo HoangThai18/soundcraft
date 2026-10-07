@@ -13,6 +13,7 @@ pub mod menus;
 pub mod midi_editor;
 pub mod mix_window;
 pub mod ops_windows;
+pub mod palette;
 pub mod panels;
 pub mod score_editor;
 pub mod shortcuts;
@@ -82,6 +83,7 @@ pub struct UiState {
     pub show_midi_ops: bool,
     pub show_rtp: bool,
     pub show_score: bool,
+    pub show_search: bool,
     pub workspace_dir: String,
     pub configurations: Vec<(String, Value)>,
 }
@@ -126,6 +128,7 @@ impl Default for UiState {
             show_midi_ops: false,
             show_rtp: false,
             show_score: false,
+            show_search: false,
             workspace_dir: String::new(),
             configurations: Vec::new(),
         }
@@ -195,6 +198,7 @@ pub struct SoundApp {
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
     pub ops: ops_windows::OpsState,
+    pub palette: palette::PaletteState,
     pub synthetic: Vec<egui::Event>,
     synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -235,6 +239,7 @@ impl SoundApp {
             edit_layout: edit_window::EditLayout::default(),
             midi: midi_editor::MidiEditorState::default(),
             ops: ops_windows::OpsState::default(),
+            palette: palette::PaletteState::default(),
             synthetic: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
@@ -724,6 +729,7 @@ impl SoundApp {
         windows::show(self, &ctx);
         ops_windows::show(self, &ctx);
         score_editor::show(self, &ctx);
+        palette::show(self, &ctx);
         dialogs::show(self, &ctx);
     }
 
