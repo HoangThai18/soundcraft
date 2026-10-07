@@ -4,7 +4,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold, mono, regular, rgb};
 use egui::{Align2, Color32, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::json;
-use soundcraft_time::{TimeFormat, format_position};
+use soundcraft_time::format_position;
 
 fn panel_header(ui: &mut Ui, title: &str) {
     let t = Tokens::DARK;
