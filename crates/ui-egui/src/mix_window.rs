@@ -111,6 +111,55 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     let views = app.ui.mix_views.clone();
     let has = |v: &str| views.iter().any(|x| x == v);
     let all = has("all");
+    // Preamp, instrument and object rows keep their height on every strip so sections line up;
+    // their controls only appear on tracks with an input.
+    let has_input = matches!(track.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi);
+    if all || has("mic_preamps") {
+        // Input gain stage ahead of the inserts (the track's trim).
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 34.0));
+        ui.painter().rect_filled(sec, 2.0, t.strip_section);
+        section_label(ui, sec, "PREAMP");
+        if has_input {
+            let kr = Rect::from_min_size(pos2(x0 + 6.0, sec.min.y + 15.0), vec2(inner_w - 12.0, 16.0));
+            let mut db = track.mixer.trim_db;
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(kr));
+            let resp = c.add_sized(kr.size(), egui::DragValue::new(&mut db).range(-24.0..=24.0).speed(0.1).suffix(" dB").max_decimals(1));
+            if resp.changed() {
+                let _ = app.engine.execute_merged("mix.trim", &json!({"tracks": [id.0], "db": db}), &format!("trim:{}", id.0));
+            }
+            if resp.drag_stopped() || resp.lost_focus() {
+                app.engine.end_merge();
+            }
+        }
+        y = sec.max.y + 4.0;
+    }
+    if all || has("instruments") {
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 34.0));
+        ui.painter().rect_filled(sec, 2.0, t.strip_section);
+        section_label(ui, sec, "INSTRUMENT");
+        let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 16.0), vec2(inner_w - 4.0, 15.0));
+        let slot = track.mixer.inserts.iter().position(|i| i.as_ref().is_some_and(|i| plugin_info(&i.plugin).is_some_and(|p| p.is_instrument)));
+        match slot {
+            Some(k) => insert_slot(app, ui, &track, k, sr),
+            None if matches!(track.kind, TrackKind::Instrument | TrackKind::Midi) => {
+                ui.painter().text(sr.center(), Align2::CENTER_CENTER, "MIDI in: all", regular(9.0), t.text_dim);
+            }
+            None => {}
+        }
+        y = sec.max.y + 4.0;
+    }
+    if all || has("object") {
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 20.0));
+        if has_input {
+            let on = app.engine.session().edit.flag(&format!("object.{}", id.0));
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(sec));
+            let label = egui::RichText::new(if on { "OBJECT" } else { "BED" }).font(bold(9.0));
+            if c.add_sized(sec.size(), egui::Button::new(label).selected(on)).on_hover_text("Route as an immersive object or to the bed").clicked() {
+                let _ = app.run("track.object", json!({"tracks": [id.0], "object": !on}));
+            }
+        }
+        y = sec.max.y + 4.0;
+    }
     for (key, title, off, is_send) in [
         ("inserts_ae", "INSERTS A-E", 0usize, false),
         ("inserts_fj", "INSERTS F-J", 5, false),
