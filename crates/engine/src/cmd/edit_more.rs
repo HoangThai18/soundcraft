@@ -108,6 +108,15 @@ pub fn specs() -> Vec<CommandSpec> {
             paste_merge_midi
         ),
         cmd!(
+            "edit.paste_merge_markers",
+            "Merge Markers",
+            ["Edit", "Paste Special"],
+            None,
+            "{at?} — adds the copied markers at the insertion point, skipping any that already exist there",
+            has_marker_clipboard,
+            paste_merge_markers
+        ),
+        cmd!(
             "edit.paste_to_current_automation",
             "To Current Automation Type",
             ["Edit", "Paste Special"],
@@ -888,10 +897,56 @@ fn trim_glide(e: &mut Engine, p: &Value, glide: bool, pan_only: bool, id: &str) 
     Ok(json!({"lanes": lanes}))
 }
 
+fn has_marker_clipboard(e: &Engine) -> std::result::Result<(), String> {
+    if e.clipboard.markers.is_empty() { Err("no markers on the clipboard".into()) } else { Ok(()) }
+}
+
+fn paste_merge_markers(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = "edit.paste_merge_markers";
+    if e.clipboard.markers.is_empty() {
+        return Err(bad(id, "no markers on the clipboard (copy a range that contains markers)"));
+    }
+    let at = position_param(e, id, p, "at")?.unwrap_or(e.session().edit.selection.start).max(0);
+    let copied = e.clipboard.markers.clone();
+    let s = e.session_mut();
+    let mut added = 0;
+    for m in copied {
+        let start = at.saturating_add(m.start);
+        if s.markers.iter().any(|x| x.start == start && x.name == m.name && x.ruler == m.ruler) {
+            continue;
+        }
+        let new = s.add_marker(&m.name, m.kind, start, start.saturating_add(m.end - m.start));
+        if let Some(x) = s.markers.iter_mut().find(|x| x.id == new) {
+            x.comments = m.comments;
+            x.color = m.color;
+            x.ruler = m.ruler;
+        }
+        added += 1;
+    }
+    Ok(json!({"added": added}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soundcraft_model::{ChannelFormat, SourceId, TrackKind};
+
+    #[test]
+    fn merge_markers_pastes_copied_markers_once() {
+        let mut e = crate::demo::demo_engine();
+        let first = e.session().markers.first().cloned().expect("demo has markers");
+        let r = json!({"start": first.start.saturating_sub(10).max(0), "end": first.start + 10});
+        e.execute("edit.select", &json!({"tracks": ["Kick"], "start": r["start"], "end": r["end"]})).unwrap();
+        e.execute("edit.copy", &json!({})).unwrap();
+        let before = e.session().markers.len();
+        let at = 5_000_000;
+        let out = e.execute("edit.paste_merge_markers", &json!({"at": at})).unwrap();
+        assert_eq!(out["added"], 1);
+        assert_eq!(e.session().markers.len(), before + 1);
+        assert!(e.session().markers.iter().any(|m| m.name == first.name && m.start == at + first.start - r["start"].as_i64().unwrap()));
+        // Pasting again at the same place adds nothing.
+        assert_eq!(e.execute("edit.paste_merge_markers", &json!({"at": at})).unwrap()["added"], 0);
+    }
 
     fn session_with_clips(starts: &[(Samples, Samples)]) -> (Engine, soundcraft_model::TrackId, Vec<ClipId>) {
         let mut s = Session::default();
