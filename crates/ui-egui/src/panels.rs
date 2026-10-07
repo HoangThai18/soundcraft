@@ -319,6 +319,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                     if ui.button(label).clicked() {
                         let _ = app.run("mix.insert_bypass", json!({"track": tid.0, "slot": slot}));
                     }
+                    ui.menu_button("Presets ▾", |ui| preset_menu(app, ui, tid, slot, info, &ins));
                 });
                 if info.id == "eq_7band" || info.id == "eq_1band" {
                     eq_curve(ui, info.id, &ins);
@@ -418,4 +419,61 @@ fn session_info(app: &mut SoundApp, ctx: &egui::Context) {
         });
     });
     app.ui.show_session_info = open;
+}
+
+/// Folder for a plugin's user presets.
+fn preset_dir(app: &SoundApp, plugin: &str) -> Option<std::path::PathBuf> {
+    app.preset_dir.as_ref().map(|d| d.join(crate::preset_folder_name(plugin)))
+}
+
+fn preset_menu(
+    app: &mut SoundApp,
+    ui: &mut Ui,
+    tid: soundcraft_model::TrackId,
+    slot: usize,
+    info: &soundcraft_dsp::PluginInfo,
+    ins: &soundcraft_model::Insert,
+) {
+    if ui.button("<factory default>").clicked() {
+        let defaults: serde_json::Map<String, serde_json::Value> = info.params.iter().map(|p| (p.id.to_string(), json!(p.default))).collect();
+        let _ = app.run("mix.insert_params", json!({"track": tid.0, "slot": slot, "params": defaults, "preset": "<factory default>"}));
+        ui.close();
+    }
+    let Some(dir) = preset_dir(app, info.id) else {
+        ui.label("User presets need the desktop app.");
+        return;
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| rd.flatten().filter_map(|e| e.path().file_stem().and_then(|x| x.to_str()).map(str::to_string)).collect())
+        .unwrap_or_default();
+    names.sort();
+    for n in &names {
+        if ui.button(n).clicked() {
+            if let Ok(text) = std::fs::read_to_string(dir.join(format!("{n}.json")))
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            {
+                let _ = app.run(
+                    "mix.insert_params",
+                    json!({"track": tid.0, "slot": slot, "params": v.get("params").cloned().unwrap_or_default(), "preset": n}),
+                );
+            }
+            ui.close();
+        }
+    }
+    ui.separator();
+    let key = egui::Id::new(("preset_name", tid.0, slot));
+    let mut name: String = ui.ctx().memory(|m| m.data.get_temp(key)).unwrap_or_else(|| format!("{} preset", info.name));
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut name).desired_width(140.0));
+        if ui.button("Save").clicked() {
+            let clean = soundcraft_engine::io::sanitize_name(&name);
+            let body = json!({"format": "soundcraft-plugin-preset", "plugin": info.id, "params": ins.params});
+            let ok = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(dir.join(format!("{clean}.json")), body.to_string()).is_ok();
+            app.ui.status = if ok { format!("Saved preset {clean}") } else { "Could not save the preset".into() };
+            if ok {
+                let _ = app.run("mix.insert_params", json!({"track": tid.0, "slot": slot, "params": {}, "preset": clean}));
+            }
+        }
+    });
+    ui.ctx().memory_mut(|m| m.data.insert_temp(key, name));
 }

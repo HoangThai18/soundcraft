@@ -136,6 +136,11 @@ pub struct Services {
     pub pick_save: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
 }
 
+/// File-system-safe folder name for a plugin id (`clap:com.x.y` → `clap_com.x.y`).
+pub fn preset_folder_name(plugin: &str) -> String {
+    plugin.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
 /// Ballistic meter display state per strip.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeterDisplay {
@@ -173,6 +178,8 @@ pub struct SoundApp {
     pub services: Services,
     /// Folder for crash-recovery autosaves (native apps set it).
     pub autosave_dir: Option<std::path::PathBuf>,
+    /// Folder for user plugin presets (native apps set it).
+    pub preset_dir: Option<std::path::PathBuf>,
     last_autosave: f64,
     pub dialogs: dialogs::Dialogs,
     pub meters: HashMap<TrackId, MeterDisplay>,
@@ -212,6 +219,7 @@ impl SoundApp {
             ui: UiState::default(),
             services,
             autosave_dir: None,
+            preset_dir: None,
             last_autosave: 0.0,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),
