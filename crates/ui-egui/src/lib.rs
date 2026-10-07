@@ -10,12 +10,14 @@ pub mod edit_window;
 pub mod fonts;
 pub mod icons;
 pub mod menus;
+pub mod midi_editor;
 pub mod mix_window;
 pub mod panels;
 pub mod shortcuts;
 pub mod theme;
 pub mod toolbar;
 pub mod widgets;
+pub mod windows;
 
 use serde_json::{Value, json};
 use soundcraft_engine::{Engine, TransportRequest};
@@ -36,6 +38,7 @@ pub enum MainWindow {
 
 /// UI state (serde, so agents can read and set it).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct UiState {
     pub window: MainWindow,
     pub show_tracks_list: bool,
@@ -57,6 +60,18 @@ pub struct UiState {
     pub plugin_windows: Vec<(TrackId, usize)>,
     pub audiosuite: Option<String>,
     pub status: String,
+    pub show_automation: bool,
+    pub show_color_palette: bool,
+    pub show_disk_usage: bool,
+    pub show_system_usage: bool,
+    pub show_task_manager: bool,
+    pub show_metadata: bool,
+    pub show_event_list: bool,
+    pub show_midi_keyboard: bool,
+    pub show_workspace: bool,
+    pub show_configurations: bool,
+    pub workspace_dir: String,
+    pub configurations: Vec<(String, Value)>,
 }
 
 impl Default for UiState {
@@ -79,6 +94,18 @@ impl Default for UiState {
             plugin_windows: Vec::new(),
             audiosuite: None,
             status: String::new(),
+            show_automation: false,
+            show_color_palette: false,
+            show_disk_usage: false,
+            show_system_usage: false,
+            show_task_manager: false,
+            show_metadata: false,
+            show_event_list: false,
+            show_midi_keyboard: false,
+            show_workspace: false,
+            show_configurations: false,
+            workspace_dir: String::new(),
+            configurations: Vec::new(),
         }
     }
 }
@@ -117,6 +144,9 @@ pub enum Gesture {
 pub struct SoundApp {
     pub engine: Engine,
     pub player: Option<Player>,
+    /// Input capture, opened on first record.
+    pub recorder: Option<soundcraft_playback::record::Recorder>,
+    record_start: Samples,
     pub ui: UiState,
     pub services: Services,
     pub dialogs: dialogs::Dialogs,
@@ -124,6 +154,7 @@ pub struct SoundApp {
     pub main_meter: MeterDisplay,
     pub gesture: Option<Gesture>,
     pub edit_layout: edit_window::EditLayout,
+    pub midi: midi_editor::MidiEditorState,
     pub synthetic: Vec<egui::Event>,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<control::PendingShot>,
@@ -133,6 +164,8 @@ pub struct SoundApp {
     /// Transport simulation when there is no player (tests, offscreen renders).
     sim: Option<(Samples, Option<Samples>, Option<Range>)>,
     pub quit_requested: bool,
+    /// Reset floating-window positions next frame (Window › Arrange).
+    pub arrange_request: bool,
     pub frame_ms: f32,
     last_frame: Option<f64>,
 }
@@ -142,6 +175,8 @@ impl SoundApp {
         SoundApp {
             engine,
             player,
+            recorder: None,
+            record_start: 0,
             ui: UiState::default(),
             services,
             dialogs: dialogs::Dialogs::default(),
@@ -149,6 +184,7 @@ impl SoundApp {
             main_meter: MeterDisplay::default(),
             gesture: None,
             edit_layout: edit_window::EditLayout::default(),
+            midi: midi_editor::MidiEditorState::default(),
             synthetic: Vec::new(),
             control_rx: None,
             pending_shots: Vec::new(),
@@ -157,6 +193,7 @@ impl SoundApp {
             fonts_installed: false,
             sim: None,
             quit_requested: false,
+            arrange_request: false,
             frame_ms: 0.0,
             last_frame: None,
         }
@@ -211,6 +248,9 @@ impl SoundApp {
         if let Some(p) = &self.player {
             p.stop();
         }
+        if self.engine.transport.recording {
+            self.finish_recording();
+        }
         self.sim = None;
         self.engine.transport.playing = false;
         self.engine.transport.recording = false;
@@ -218,6 +258,45 @@ impl SoundApp {
         if s.edit.insertion_follows_playback {
             let pos = self.engine.transport.position;
             self.engine.session_mut().edit.selection = Range::point(pos);
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let armed = self.engine.session().tracks.iter().any(|t| t.mixer.record_arm);
+        if !armed {
+            self.ui.status = "Record-enable a track first (the red button in its header).".into();
+            return;
+        }
+        if self.recorder.is_none() && self.player.is_some() {
+            match soundcraft_playback::record::Recorder::open() {
+                Ok(r) => self.recorder = Some(r),
+                Err(e) => {
+                    self.ui.status = format!("Cannot record: {e}");
+                    return;
+                }
+            }
+        }
+        self.record_start = self.engine.session().edit.selection.start;
+        if let Some(r) = &self.recorder {
+            r.arm();
+        }
+        self.engine.transport.recording = true;
+        if !self.is_playing() {
+            let sel = self.engine.session().edit.selection;
+            // Record into the selection when there is one (punch), else open-ended.
+            let end = (!sel.is_empty()).then_some(sel.end);
+            self.start_play(sel.start, end, None);
+        }
+    }
+
+    fn finish_recording(&mut self) {
+        self.engine.transport.recording = false;
+        let Some(r) = &self.recorder else { return };
+        let take = r.take();
+        let rate = take.sample_rate;
+        match soundcraft_engine::io::add_recording(&mut self.engine, self.record_start, take.channels, rate) {
+            Ok(ids) => self.ui.status = format!("Recorded {} clip(s)", ids.len()),
+            Err(e) => self.ui.status = e.to_string(),
         }
     }
 
@@ -254,9 +333,10 @@ impl SoundApp {
                     }
                 }
                 TransportRequest::Record => {
-                    self.engine.transport.recording = true;
-                    if !self.is_playing() {
-                        self.play_from_selection();
+                    if self.engine.transport.recording {
+                        self.stop_play();
+                    } else {
+                        self.start_recording();
                     }
                 }
                 TransportRequest::Locate(at) => {
@@ -287,8 +367,8 @@ impl SoundApp {
         // Read back the position.
         if let Some(p) = &self.player {
             let playing = p.is_playing();
-            if self.engine.transport.playing && !playing {
-                self.engine.transport.playing = false;
+            let ended = self.engine.transport.playing && !playing;
+            if ended {
                 p.set_speed(1.0);
             }
             if self.engine.transport.playing {
@@ -301,6 +381,9 @@ impl SoundApp {
             }
             let main = snap.main.peak;
             feed_meter(&mut self.main_meter, main, 0.0, dt);
+            if ended {
+                self.stop_play();
+            }
         } else if let Some((pos, end, looped)) = &mut self.sim {
             let sr = self.engine.session().sample_rate.as_f64();
             *pos += (f64::from(dt) * sr) as i64;
@@ -379,6 +462,10 @@ impl SoundApp {
             ctx.request_repaint();
             return;
         }
+        if self.arrange_request {
+            self.arrange_request = false;
+            ctx.memory_mut(|m| m.reset_areas());
+        }
         shortcuts::handle(self, &ctx);
         menus::menu_bar(self, ui);
         match self.ui.window {
@@ -386,6 +473,7 @@ impl SoundApp {
             MainWindow::Mix => mix_window::show(self, ui),
         }
         panels::floating(self, &ctx);
+        windows::show(self, &ctx);
         dialogs::show(self, &ctx);
     }
 

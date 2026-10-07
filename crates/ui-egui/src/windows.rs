@@ -1,0 +1,318 @@
+//! Secondary floating windows (Window menu).
+
+use crate::SoundApp;
+use crate::theme::{Tokens, mono, rgb};
+use egui::{Color32, Sense, vec2};
+use serde_json::json;
+use soundcraft_model::{AutomationMode, ClipContent};
+
+pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
+    automation(app, ctx);
+    color_palette(app, ctx);
+    disk_usage(app, ctx);
+    system_usage(app, ctx);
+    task_manager(app, ctx);
+    metadata(app, ctx);
+    event_list(app, ctx);
+    midi_keyboard(app, ctx);
+    workspace(app, ctx);
+    configurations(app, ctx);
+}
+
+fn win(ctx: &egui::Context, open: &mut bool, title: &str, size: egui::Vec2, body: impl FnOnce(&mut egui::Ui)) {
+    if !*open {
+        return;
+    }
+    egui::Window::new(title).open(open).default_size(size).show(ctx, body);
+}
+
+fn automation(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_automation;
+    win(ctx, &mut open, "Automation", vec2(260.0, 260.0), |ui| {
+        ui.label("Write automation for the selected tracks:");
+        let tracks = app.engine.session().edit.selected_tracks.clone();
+        ui.horizontal_wrapped(|ui| {
+            for m in [AutomationMode::Off, AutomationMode::Read, AutomationMode::Touch, AutomationMode::Latch, AutomationMode::TouchLatch, AutomationMode::Write, AutomationMode::Trim] {
+                if ui.button(m.label()).clicked() {
+                    let ids: Vec<u64> = tracks.iter().map(|t| t.0).collect();
+                    let _ = app.run("mix.automation_mode", json!({"tracks": ids, "mode": m.label()}));
+                }
+            }
+        });
+        ui.separator();
+        ui.label("Enabled parameters");
+        for f in ["volume", "pan", "mute", "send level", "send pan", "send mute", "plugin"] {
+            let id = format!("automation.enable.{}", f.replace(' ', "_"));
+            let mut on = !app.engine.session().edit.flag(&format!("{id}.off"));
+            if ui.checkbox(&mut on, f).changed() {
+                app.engine.session_mut().edit.set_flag(&format!("{id}.off"), !on);
+            }
+        }
+        ui.separator();
+        if ui.button("Write to Current").clicked() {
+            let _ = app.run("automation.write_to_current", json!({}));
+        }
+        if ui.button("Thin All").clicked() {
+            let _ = app.run("automation.thin_all", json!({}));
+        }
+    });
+    app.ui.show_automation = open;
+}
+
+fn color_palette(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_color_palette;
+    win(ctx, &mut open, "Color Palette", vec2(300.0, 140.0), |ui| {
+        ui.label("Apply to selected tracks (Shift: selected clips)");
+        ui.horizontal_wrapped(|ui| {
+            for (i, c) in soundcraft_model::TRACK_COLORS.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                ui.painter().rect_filled(r, 3.0, rgb(*c));
+                if resp.clicked() {
+                    if ui.input(|x| x.modifiers.shift) {
+                        let _ = app.run("clip.color", json!({"color": c}));
+                    } else {
+                        let _ = app.run("track.color", json!({"color": i}));
+                    }
+                }
+            }
+        });
+    });
+    app.ui.show_color_palette = open;
+}
+
+fn disk_usage(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_disk_usage;
+    win(ctx, &mut open, "Disk Usage", vec2(360.0, 160.0), |ui| {
+        let s = app.engine.session();
+        let bytes: u64 = s.sources.iter().map(|x| x.frames * u64::from(x.channels) * 4).sum();
+        ui.label(format!("Session media: {} files, {:.1} MB in memory (32-bit float)", s.sources.len(), bytes as f64 / 1_048_576.0));
+        let per_min = f64::from(s.sample_rate.hz()) * 60.0 * 3.0 / 1_048_576.0;
+        ui.label(format!("Recording at 24-bit uses {per_min:.1} MB per mono track-minute"));
+        if let Some(p) = &app.engine.path {
+            ui.label(format!("Session file: {p}"));
+        }
+    });
+    app.ui.show_disk_usage = open;
+}
+
+fn system_usage(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_system_usage;
+    win(ctx, &mut open, "System Usage", vec2(320.0, 140.0), |ui| {
+        ui.label(format!("UI frame time: {:.1} ms", app.frame_ms));
+        ui.label(format!("Audio: {}", app.player.as_ref().map_or("no engine".to_string(), |p| format!("{} @ {} Hz", p.device_name, p.device_rate))));
+        let plugins: usize = app.engine.session().tracks.iter().map(|t| t.mixer.inserts.iter().flatten().count()).sum();
+        ui.label(format!("Active plugin instances: {plugins}"));
+        ui.label(format!("Tracks: {}", app.engine.session().tracks.len()));
+        ui.label(format!("Undo steps: {}", app.engine.undo_history().len()));
+    });
+    app.ui.show_system_usage = open;
+}
+
+fn task_manager(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_task_manager;
+    win(ctx, &mut open, "Task Manager", vec2(320.0, 120.0), |ui| {
+        ui.label("No background tasks are running.");
+        ui.label(egui::RichText::new("Renders, bounces and AudioSuite processes run to completion before returning.").small().color(Tokens::DARK.text_dim));
+    });
+    app.ui.show_task_manager = open;
+}
+
+fn metadata(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_metadata;
+    win(ctx, &mut open, "Metadata Inspector", vec2(380.0, 260.0), |ui| {
+        let s = app.engine.session();
+        ui.label(egui::RichText::new(&s.name).strong());
+        egui::Grid::new("meta").num_columns(2).striped(true).show(ui, |ui| {
+            for (k, v) in [
+                ("Sample rate", format!("{} Hz", s.sample_rate.hz())),
+                ("Bit depth", format!("{:?}", s.bit_depth)),
+                ("Timecode rate", s.frame_rate.label().to_string()),
+                ("Tracks", s.tracks.len().to_string()),
+                ("Clips", s.tracks.iter().map(|t| t.clips().len()).sum::<usize>().to_string()),
+                ("Audio files", s.sources.len().to_string()),
+                ("Markers", s.markers.len().to_string()),
+                ("Length", soundcraft_time::format_position(s.content_end(), soundcraft_time::TimeFormat::MinSecs, s.sample_rate, &s.tempo, s.frame_rate, 0)),
+            ] {
+                ui.label(k);
+                ui.label(v);
+                ui.end_row();
+            }
+        });
+        ui.separator();
+        let mut c = s.comments.clone();
+        ui.label("Session comments");
+        if ui.text_edit_multiline(&mut c).changed() {
+            app.engine.session_mut().comments = c;
+        }
+    });
+    app.ui.show_metadata = open;
+}
+
+fn event_list(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_event_list;
+    win(ctx, &mut open, "MIDI Event List", vec2(420.0, 360.0), |ui| {
+        let Some(cid) = crate::midi_editor::target_clip(app) else {
+            ui.label("Select a MIDI clip.");
+            return;
+        };
+        let notes = match app.engine.session().find_clip(cid).map(|(_, c)| c.content.clone()) {
+            Some(ClipContent::Midi { sequence }) => sequence.notes,
+            _ => Vec::new(),
+        };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("evl").num_columns(5).striped(true).show(ui, |ui| {
+                for h in ["Start (ticks)", "Note", "Vel", "Length", ""] {
+                    ui.label(egui::RichText::new(h).strong());
+                }
+                ui.end_row();
+                for (i, n) in notes.iter().enumerate() {
+                    ui.label(egui::RichText::new(n.start.to_string()).font(mono(11.0)));
+                    ui.label(soundcraft_midi::note_name(n.pitch));
+                    let mut v = i64::from(n.velocity);
+                    if ui.add(egui::DragValue::new(&mut v).range(1..=127)).changed() {
+                        let _ = app.engine.execute("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": v}));
+                    }
+                    ui.label(n.length.to_string());
+                    if ui.small_button("✕").clicked() {
+                        let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": [i]}));
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    });
+    app.ui.show_event_list = open;
+}
+
+fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_midi_keyboard;
+    win(ctx, &mut open, "MIDI Keyboard", vec2(640.0, 110.0), |ui| {
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(400.0), 80.0), Sense::click());
+        let whites = 28;
+        let w = r.width() / whites as f32;
+        let mut wi = 0;
+        let base = 48u8;
+        let mut clicked: Option<u8> = None;
+        let pos = resp.interact_pointer_pos();
+        for p in base..base + 48 {
+            if !matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
+                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w, r.min.y), vec2(w - 1.0, r.height()));
+                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(235, 235, 235));
+                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
+                    clicked = Some(p);
+                }
+                wi += 1;
+            }
+        }
+        wi = 0;
+        for p in base..base + 48 {
+            if matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
+                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w - w * 0.3, r.min.y), vec2(w * 0.6, r.height() * 0.6));
+                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(20, 20, 20));
+                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
+                    clicked = Some(p);
+                }
+            } else {
+                wi += 1;
+            }
+        }
+        if let Some(p) = clicked
+            && let Some(cid) = crate::midi_editor::target_clip(app)
+        {
+            // Step input: add the note at the insertion point (relative to the clip) and advance.
+            let s = app.engine.session();
+            let (clip_start, at) = (s.find_clip(cid).map_or(0, |(_, c)| c.start), s.edit.selection.start);
+            let rel = s.tempo.samples_to_ticks(at, s.sample_rate) - s.tempo.samples_to_ticks(clip_start, s.sample_rate);
+            let len = soundcraft_time::TICKS_PER_QUARTER / 2;
+            let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": p, "start_ticks": rel.max(0), "length_ticks": len}));
+            let s = app.engine.session();
+            let next = s.tempo.tick_to_samples(s.tempo.samples_to_ticks(at, s.sample_rate) + len, s.sample_rate);
+            let _ = app.run("transport.locate", json!({"at": next}));
+        }
+        ui.label(egui::RichText::new("Click keys to step-enter notes into the selected MIDI clip at the insertion point.").small());
+    });
+    app.ui.show_midi_keyboard = open;
+}
+
+fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_workspace;
+    if !open {
+        return;
+    }
+    egui::Window::new("Workspace").open(&mut open).default_size(vec2(460.0, 420.0)).show(ctx, |ui| {
+        let dir = if app.ui.workspace_dir.is_empty() { std::env::var("HOME").unwrap_or_else(|_| ".".into()) } else { app.ui.workspace_dir.clone() };
+        ui.horizontal(|ui| {
+            if ui.button("⬆").on_hover_text("Parent folder").clicked()
+                && let Some(p) = std::path::Path::new(&dir).parent()
+            {
+                app.ui.workspace_dir = p.to_string_lossy().into_owned();
+            }
+            ui.label(egui::RichText::new(&dir).small());
+        });
+        ui.separator();
+        let mut entries: Vec<(String, bool)> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                let ext = std::path::Path::new(&name).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+                (is_dir || ["wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "caf", "mid", "midi", "scraft"].contains(&ext.as_str())).then_some((name, is_dir))
+            }).collect())
+            .unwrap_or_default();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (name, is_dir) in entries.into_iter().take(2000) {
+                let path = std::path::Path::new(&dir).join(&name).to_string_lossy().into_owned();
+                let label = if is_dir { format!("📁 {name}") } else { format!("🔊 {name}") };
+                let r = ui.selectable_label(false, label);
+                if r.double_clicked() {
+                    if is_dir {
+                        app.ui.workspace_dir = path;
+                    } else if name.ends_with(".scraft") {
+                        let _ = app.run("session.open", json!({"path": path}));
+                    } else if name.ends_with(".mid") || name.ends_with(".midi") {
+                        let _ = app.run("file.import_midi", json!({"path": path}));
+                    } else {
+                        let at = app.engine.session().edit.selection.start;
+                        let _ = app.run("file.import_audio", json!({"path": path, "at": at}));
+                    }
+                }
+            }
+        });
+        ui.label(egui::RichText::new("Double-click to import audio/MIDI at the insertion point or open a session.").small());
+    });
+    app.ui.show_workspace = open;
+}
+
+fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_configurations;
+    win(ctx, &mut open, "Window Configurations", vec2(320.0, 240.0), |ui| {
+        if ui.button("New Configuration…").clicked() {
+            let n = app.ui.configurations.len() + 1;
+            let mut snap = app.ui.clone();
+            snap.configurations.clear();
+            if let Ok(v) = serde_json::to_value(&snap) {
+                app.ui.configurations.push((format!("Configuration {n}"), v));
+            }
+        }
+        ui.separator();
+        let list = app.ui.configurations.clone();
+        for (i, (name, v)) in list.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button(format!("{}  {name}", i + 1)).clicked()
+                    && let Ok(mut st) = serde_json::from_value::<crate::UiState>(v.clone())
+                {
+                    st.configurations = app.ui.configurations.clone();
+                    st.show_configurations = true;
+                    app.ui = st;
+                }
+                if ui.small_button("✕").clicked() {
+                    app.ui.configurations.remove(i);
+                }
+            });
+        }
+    });
+    app.ui.show_configurations = open;
+}

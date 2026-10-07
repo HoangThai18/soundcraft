@@ -24,6 +24,28 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
     ("window.universe", "Universe", "View > Other Displays > Universe", None),
+    ("window.automation", "Automation", "Window > Automation", Some("Cmd+4")),
+    ("window.color_palette", "Color Palette", "Window > Color Palette", None),
+    ("window.disk_usage", "Disk Usage", "Window > Disk Usage", None),
+    ("window.system_usage", "System Usage", "Window > System Usage", None),
+    ("window.task_manager", "Task Manager", "Window > Task Manager", None),
+    ("window.metadata", "Metadata Inspector", "Window > Metadata Inspector", None),
+    ("window.event_list", "MIDI Event List", "Window > MIDI Event List", None),
+    ("window.midi_keyboard", "MIDI Keyboard", "Window > MIDI Keyboard", None),
+    ("window.workspace", "Workspace", "Window > New Workspace > Default", None),
+    ("window.workspace_presets", "Workspace", "Window > New Workspace > Track Presets", None),
+    ("window.workspace_sounds", "Workspace", "Window > New Workspace > Soundbase", None),
+    ("window.workspace_front", "Workspaces to Front", "Window > Workspaces > Bring to Front", None),
+    ("window.workspace_close", "Close All Workspaces", "Window > Workspaces > Close All Workspaces", None),
+    ("window.configurations", "Window Configuration List", "Window > Configurations > Window Configuration List", None),
+    ("window.config_new", "New Configuration", "Window > Configurations > New Configuration...", None),
+    ("window.config_update", "Update Active Configuration", "Window > Configurations > Update Active Configuration", None),
+    ("window.arrange_tile", "Tile", "Window > Arrange > Tile", None),
+    ("window.arrange_tile_h", "Tile Horizontal", "Window > Arrange > Tile Horizontal", None),
+    ("window.arrange_tile_v", "Tile Vertical", "Window > Arrange > Tile Vertical", None),
+    ("window.arrange_cascade", "Cascade", "Window > Arrange > Cascade", None),
+    ("window.midi_front", "MIDI Editors to Front", "Window > MIDI Editors > Bring to Front", None),
+    ("window.midi_back", "MIDI Editors to Back", "Window > MIDI Editors > Send to Back", None),
     ("view.mix_section", "Mix Window View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
     ("ui.bounce_dialog", "Bounce Mix…", "", None),
@@ -324,7 +346,46 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.narrow_mix" => toggle(&mut app.ui.narrow_mix),
         "window.session_info" => toggle(&mut app.ui.show_session_info),
         "window.about" => toggle(&mut app.ui.show_about),
-        "window.midi_editor" => toggle(&mut app.ui.show_midi_editor),
+        "window.midi_editor" | "window.midi_front" => toggle(&mut app.ui.show_midi_editor),
+        "window.midi_back" => {
+            app.ui.show_midi_editor = false;
+            json!({})
+        }
+        "window.automation" => toggle(&mut app.ui.show_automation),
+        "window.color_palette" => toggle(&mut app.ui.show_color_palette),
+        "window.disk_usage" => toggle(&mut app.ui.show_disk_usage),
+        "window.system_usage" => toggle(&mut app.ui.show_system_usage),
+        "window.task_manager" => toggle(&mut app.ui.show_task_manager),
+        "window.metadata" => toggle(&mut app.ui.show_metadata),
+        "window.event_list" => toggle(&mut app.ui.show_event_list),
+        "window.midi_keyboard" => toggle(&mut app.ui.show_midi_keyboard),
+        "window.workspace" | "window.workspace_presets" | "window.workspace_sounds" | "window.workspace_front" => {
+            app.ui.show_workspace = true;
+            json!({"value": true})
+        }
+        "window.workspace_close" => {
+            app.ui.show_workspace = false;
+            json!({"value": false})
+        }
+        "window.configurations" => toggle(&mut app.ui.show_configurations),
+        "window.config_new" | "window.config_update" => {
+            let mut snap = app.ui.clone();
+            snap.configurations.clear();
+            let v = serde_json::to_value(&snap).unwrap_or_default();
+            if id == "window.config_update" && !app.ui.configurations.is_empty() {
+                if let Some(last) = app.ui.configurations.last_mut() {
+                    last.1 = v;
+                }
+            } else {
+                let n = app.ui.configurations.len() + 1;
+                app.ui.configurations.push((format!("Configuration {n}"), v));
+            }
+            json!({"configurations": app.ui.configurations.len()})
+        }
+        "window.arrange_tile" | "window.arrange_tile_h" | "window.arrange_tile_v" | "window.arrange_cascade" => {
+            app.arrange_request = true;
+            json!({})
+        }
         "window.universe" => toggle(&mut app.ui.show_universe),
         "window.close" | "window.hide_floating" => {
             app.ui.show_transport = false;
