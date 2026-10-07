@@ -1,0 +1,48 @@
+# Architecture
+
+SoundCraft is a Cargo workspace of small crates with enforced layering (`cargo xtask layers`).
+Nothing below the UI knows about egui, so the interface can be replaced.
+
+```
+L0  time        audio-io        midi            (standalone: no workspace deps)
+L1  dsp         clap-host                       (plugins; clap-host is the only unsafe crate)
+L2  model                                       (the session document)
+L3  mix                                         (the mix engine)
+L4  engine      playback                        (commands, undo, I/O · audio devices)
+L5  automation                                  (MCP server, control-channel client)
+L6  ui-egui                                     (the user interface)
+    apps: soundcraft (desktop) · soundcraft-cli · soundcraft-web (wasm)
+```
+
+## The document
+
+`soundcraft_model::Session` is plain data (serde): tracks with playlists of clips, mixer state
+(inserts, sends, routing, automation lanes), tempo and meter maps, memory locations, groups,
+busses, and `EditState` (selection, tools, modes, view flags). Decoded audio lives in a
+`SourcePool` of `Arc`s that is not serialised; cloning a session is cheap. Sessions save as
+`.scraft` JSON plus an `Audio Files/` folder.
+
+## Commands and undo
+
+Every user action is a `CommandSpec` (id, label, menu path, shortcut, params doc, enabled, run)
+registered in `crates/engine/src/cmd/`. `Engine::execute(id, params)` runs it, catches any escaped
+panic, and pushes an undo snapshot (the previous `Arc<Session>`) when the document changed.
+Continuous gestures use `execute_merged` so a fader drag is one undo step. Menus are built from
+the incumbent's menu catalog (`crates/engine/catalog/menus.txt`); a menu item lights up when a
+command has the same menu path and label (or an alias maps it), which also drives the parity
+report.
+
+## Audio
+
+`soundcraft_mix::MixEngine::render(session, pos, frames, out)` renders one block: clips (gain,
+fades, clip effects) → trim → inserts → pre-fader sends → fader/mute (automation, VCA, trim
+automation) → post-fader sends → pan → busses → aux inputs → master faders. Independent strips
+process in parallel; plugin delay compensation aligns every path. The same engine renders
+bounces offline (`render_range`) and realtime playback (`soundcraft_playback::Player`, which owns
+it on the audio thread and receives new session snapshots through a channel).
+
+## Agent control
+
+The desktop app's control channel (JSON lines over TCP) exposes engine commands, inspection,
+synthetic input and screenshots; `soundcraft-cli mcp` wraps either a headless engine or a running
+app as an MCP server. See `control-protocol.md` and `mcp.md`.
