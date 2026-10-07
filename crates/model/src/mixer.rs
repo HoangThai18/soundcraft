@@ -17,14 +17,32 @@ pub enum ChannelFormat {
     Lcrs,
     Surround50,
     Surround51,
+    Surround60,
+    Surround61,
+    Sdds70,
+    Sdds71,
     Surround70,
     Surround71,
+    Atmos702,
     Atmos712,
+    Atmos502,
+    Atmos512,
+    Atmos504,
+    Atmos514,
+    Atmos704,
     Atmos714,
+    Atmos706,
+    Atmos716,
+    Atmos904,
+    Atmos914,
+    Atmos906,
+    Atmos916,
+    /// Ambisonics of order 1..=7 ((n+1)² channels).
+    Ambisonics(u8),
 }
 
 impl ChannelFormat {
-    pub const ALL: [ChannelFormat; 11] = [
+    pub const ALL: [ChannelFormat; 34] = [
         ChannelFormat::Mono,
         ChannelFormat::Stereo,
         ChannelFormat::Lcr,
@@ -32,10 +50,33 @@ impl ChannelFormat {
         ChannelFormat::Lcrs,
         ChannelFormat::Surround50,
         ChannelFormat::Surround51,
+        ChannelFormat::Surround60,
+        ChannelFormat::Surround61,
+        ChannelFormat::Sdds70,
+        ChannelFormat::Sdds71,
         ChannelFormat::Surround70,
         ChannelFormat::Surround71,
+        ChannelFormat::Atmos702,
         ChannelFormat::Atmos712,
+        ChannelFormat::Ambisonics(1),
+        ChannelFormat::Ambisonics(2),
+        ChannelFormat::Ambisonics(3),
+        ChannelFormat::Ambisonics(4),
+        ChannelFormat::Ambisonics(5),
+        ChannelFormat::Ambisonics(6),
+        ChannelFormat::Ambisonics(7),
+        ChannelFormat::Atmos502,
+        ChannelFormat::Atmos512,
+        ChannelFormat::Atmos504,
+        ChannelFormat::Atmos514,
+        ChannelFormat::Atmos704,
         ChannelFormat::Atmos714,
+        ChannelFormat::Atmos706,
+        ChannelFormat::Atmos716,
+        ChannelFormat::Atmos904,
+        ChannelFormat::Atmos914,
+        ChannelFormat::Atmos906,
+        ChannelFormat::Atmos916,
     ];
     pub fn channels(self) -> usize {
         match self {
@@ -44,11 +85,21 @@ impl ChannelFormat {
             ChannelFormat::Lcr => 3,
             ChannelFormat::Quad | ChannelFormat::Lcrs => 4,
             ChannelFormat::Surround50 => 5,
-            ChannelFormat::Surround51 => 6,
-            ChannelFormat::Surround70 => 7,
-            ChannelFormat::Surround71 => 8,
-            ChannelFormat::Atmos712 => 10,
+            ChannelFormat::Surround51 | ChannelFormat::Surround60 => 6,
+            ChannelFormat::Surround61 | ChannelFormat::Sdds70 | ChannelFormat::Surround70 | ChannelFormat::Atmos502 => 7,
+            ChannelFormat::Sdds71 | ChannelFormat::Surround71 | ChannelFormat::Atmos512 => 8,
+            ChannelFormat::Atmos702 | ChannelFormat::Atmos504 => 9,
+            ChannelFormat::Atmos712 | ChannelFormat::Atmos514 => 10,
+            ChannelFormat::Atmos704 => 11,
             ChannelFormat::Atmos714 => 12,
+            ChannelFormat::Atmos706 | ChannelFormat::Atmos904 => 13,
+            ChannelFormat::Atmos716 | ChannelFormat::Atmos914 => 14,
+            ChannelFormat::Atmos906 => 15,
+            ChannelFormat::Atmos916 => 16,
+            ChannelFormat::Ambisonics(n) => {
+                let n = usize::from(n.clamp(1, 7)) + 1;
+                n * n
+            }
         }
     }
     pub fn label(self) -> &'static str {
@@ -60,18 +111,44 @@ impl ChannelFormat {
             ChannelFormat::Lcrs => "LCRS",
             ChannelFormat::Surround50 => "5.0",
             ChannelFormat::Surround51 => "5.1",
+            ChannelFormat::Surround60 => "6.0",
+            ChannelFormat::Surround61 => "6.1",
+            ChannelFormat::Sdds70 => "7.0 SDDS",
+            ChannelFormat::Sdds71 => "7.1 SDDS",
             ChannelFormat::Surround70 => "7.0",
             ChannelFormat::Surround71 => "7.1",
+            ChannelFormat::Atmos702 => "7.0.2",
             ChannelFormat::Atmos712 => "7.1.2",
+            ChannelFormat::Atmos502 => "5.0.2",
+            ChannelFormat::Atmos512 => "5.1.2",
+            ChannelFormat::Atmos504 => "5.0.4",
+            ChannelFormat::Atmos514 => "5.1.4",
+            ChannelFormat::Atmos704 => "7.0.4",
             ChannelFormat::Atmos714 => "7.1.4",
+            ChannelFormat::Atmos706 => "7.0.6",
+            ChannelFormat::Atmos716 => "7.1.6",
+            ChannelFormat::Atmos904 => "9.0.4",
+            ChannelFormat::Atmos914 => "9.1.4",
+            ChannelFormat::Atmos906 => "9.0.6",
+            ChannelFormat::Atmos916 => "9.1.6",
+            ChannelFormat::Ambisonics(1) => "1st Order Ambisonics",
+            ChannelFormat::Ambisonics(2) => "2nd Order Ambisonics",
+            ChannelFormat::Ambisonics(3) => "3rd Order Ambisonics",
+            ChannelFormat::Ambisonics(4) => "4th Order Ambisonics",
+            ChannelFormat::Ambisonics(5) => "5th Order Ambisonics",
+            ChannelFormat::Ambisonics(6) => "6th Order Ambisonics",
+            ChannelFormat::Ambisonics(_) => "7th Order Ambisonics",
         }
     }
     pub fn from_id(s: &str) -> Option<ChannelFormat> {
-        ChannelFormat::ALL.into_iter().find(|f| f.label().eq_ignore_ascii_case(s))
+        ChannelFormat::ALL.into_iter().find(|f| f.label().eq_ignore_ascii_case(s.trim()))
     }
     /// Best format for a channel count.
     pub fn for_channels(n: usize) -> ChannelFormat {
-        ChannelFormat::ALL.into_iter().find(|f| f.channels() == n).unwrap_or(if n <= 1 { ChannelFormat::Mono } else { ChannelFormat::Stereo })
+        [ChannelFormat::Mono, ChannelFormat::Stereo, ChannelFormat::Lcr, ChannelFormat::Quad, ChannelFormat::Surround50, ChannelFormat::Surround51, ChannelFormat::Surround70, ChannelFormat::Surround71]
+            .into_iter()
+            .find(|f| f.channels() == n)
+            .unwrap_or(if n <= 1 { ChannelFormat::Mono } else { ChannelFormat::Stereo })
     }
 }
 
