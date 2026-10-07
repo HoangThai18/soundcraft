@@ -169,7 +169,13 @@ fn main_area(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::DARK;
     let full = ui.max_rect();
     let rulers: Vec<String> = app.engine.session().edit.rulers.clone();
-    let rulers_h = RULER_H * rulers.len() as f32 + 6.0;
+    let mut rulers = rulers;
+    if app.engine.session().edit.flag("view.ruler.tempo_editor")
+        && let Some(i) = rulers.iter().position(|r| r == "tempo")
+    {
+        rulers.insert(i + 1, "tempo_editor".into());
+    }
+    let rulers_h = rulers.iter().map(|r| ruler_height(r)).sum::<f32>() + 6.0;
     let hscroll_h = 14.0;
     let hw = header_width(app.engine.session());
     let header = Rect::from_min_max(full.min, pos2(full.min.x + hw, full.max.y - hscroll_h));
@@ -281,7 +287,52 @@ fn ruler_label(id: &str) -> &'static str {
         "markers3" => "Markers 3",
         "markers4" => "Markers 4",
         "markers5" => "Markers 5",
+        "tempo_editor" => "",
         _ => "",
+    }
+}
+
+pub fn ruler_height(id: &str) -> f32 {
+    if id == "tempo_editor" { 56.0 } else { RULER_H }
+}
+
+/// The tempo editor: a graph of tempo over time. Click adds a change, Alt-click removes the nearest.
+fn tempo_editor(app: &mut SoundApp, ui: &mut Ui, painter: &egui::Painter, s: &Session, tl: Rect, row: Rect) {
+    let sr = s.sample_rate;
+    painter.rect_filled(row, 0.0, Color32::from_rgb(24, 40, 32));
+    let (lo, hi) = s.tempo.tempos().iter().fold((f64::MAX, f64::MIN), |(a, b), e| (a.min(e.bpm), b.max(e.bpm)));
+    let (lo, hi) = ((lo - 20.0).max(20.0), (hi + 20.0).min(400.0));
+    let y_of = |bpm: f64| row.max.y - 4.0 - ((bpm - lo) / (hi - lo).max(1.0)) as f32 * (row.height() - 8.0);
+    let mut pts = Vec::new();
+    let evs = s.tempo.tempos();
+    for (k, e) in evs.iter().enumerate() {
+        let x = x_of(s, tl, s.tempo.tick_to_samples(e.tick, sr)).max(tl.min.x);
+        let x_next = evs.get(k + 1).map_or(tl.max.x, |n| x_of(s, tl, s.tempo.tick_to_samples(n.tick, sr)));
+        pts.push(pos2(x, y_of(e.bpm)));
+        pts.push(pos2(x_next.min(tl.max.x), y_of(e.bpm)));
+        painter.circle_filled(pos2(x, y_of(e.bpm)), 3.0, Color32::from_rgb(140, 230, 160));
+    }
+    painter.add(Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(140, 230, 160))));
+    painter.text(pos2(tl.min.x + 4.0, row.min.y + 8.0), Align2::LEFT_CENTER, format!("{hi:.0}"), regular(9.0), Color32::from_rgb(120, 160, 130));
+    painter.text(pos2(tl.min.x + 4.0, row.max.y - 8.0), Align2::LEFT_CENTER, format!("{lo:.0}"), regular(9.0), Color32::from_rgb(120, 160, 130));
+    let resp = ui.interact(row, ui.id().with("tempo_editor"), Sense::click());
+    if resp.clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let at = snap(s, sample_at(s, tl, p.x).max(0));
+        if ui.input(|i| i.modifiers.alt) {
+            let near = evs
+                .iter()
+                .filter(|e| e.tick > 0)
+                .min_by_key(|e| ((x_of(s, tl, s.tempo.tick_to_samples(e.tick, sr)) - p.x).abs() * 10.0) as i64)
+                .map(|e| s.tempo.tick_to_samples(e.tick, sr));
+            if let Some(n) = near {
+                let _ = app.run("event.tempo_remove", json!({"at": n}));
+            }
+        } else {
+            let bpm = lo + f64::from((row.max.y - 4.0 - p.y) / (row.height() - 8.0)) * (hi - lo);
+            let _ = app.run("event.tempo", json!({"bpm": (bpm * 10.0).round() / 10.0, "at": at}));
+        }
     }
 }
 
@@ -303,10 +354,12 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
     ui.painter().rect_filled(area, 0.0, t.ruler_bg);
     let view = Range::new(sample_at(&s, tl, tl.min.x), sample_at(&s, tl, tl.max.x));
     let sr = s.sample_rate;
+    let mut y0 = area.min.y + 3.0;
     for (i, id) in rulers.iter().enumerate() {
-        let y0 = area.min.y + 3.0 + i as f32 * RULER_H;
-        let row = Rect::from_min_max(pos2(tl.min.x, y0), pos2(tl.max.x, y0 + RULER_H));
-        let lab = Rect::from_min_max(pos2(area.min.x, y0), pos2(tl.min.x, y0 + RULER_H));
+        let h = ruler_height(id);
+        let row = Rect::from_min_max(pos2(tl.min.x, y0), pos2(tl.max.x, y0 + h));
+        let lab = Rect::from_min_max(pos2(area.min.x, y0), pos2(tl.min.x, y0 + h));
+        y0 += h;
         let painter = ui.painter().with_clip_rect(row);
         ui.painter().text(pos2(lab.max.x - 12.0, lab.center().y), Align2::RIGHT_CENTER, ruler_label(id), bold(11.0), t.ruler_text);
         let fmt = TimeFormat::from_id(id);
@@ -327,6 +380,7 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                         suffix: "bpm".into(),
                     });
                 }
+                let mut last_label = f32::MIN;
                 for ev in s.tempo.tempos() {
                     let x = x_of(&s, tl, s.tempo.tick_to_samples(ev.tick, sr));
                     painter.add(Shape::convex_polygon(
@@ -334,13 +388,16 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                         Color32::from_rgb(220, 60, 50),
                         Stroke::NONE,
                     ));
-                    painter.text(
-                        pos2(x + 10.0, row.center().y),
-                        Align2::LEFT_CENTER,
-                        format!("{}", (ev.bpm * 100.0).round() / 100.0),
-                        bold(11.0),
-                        Color32::from_rgb(230, 240, 230),
-                    );
+                    if x - last_label > 46.0 {
+                        last_label = x;
+                        painter.text(
+                            pos2(x + 10.0, row.center().y),
+                            Align2::LEFT_CENTER,
+                            format!("{}", (ev.bpm * 100.0).round() / 100.0),
+                            bold(11.0),
+                            Color32::from_rgb(230, 240, 230),
+                        );
+                    }
                 }
             }
             "meter" => {
@@ -355,6 +412,9 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                         Color32::from_rgb(230, 236, 240),
                     );
                 }
+            }
+            "tempo_editor" => {
+                tempo_editor(app, ui, &painter, &s, tl, row);
             }
             "key" => {
                 painter.rect_filled(row, 0.0, Color32::from_rgb(64, 52, 88));
