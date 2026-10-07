@@ -709,6 +709,21 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
 fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, selected: bool) {
     let t = Tokens::DARK;
     let id = track.id;
+    // Drag the bottom edge to resize (snaps to the height presets).
+    let edge = Rect::from_min_max(pos2(head.min.x, head.max.y - 4.0), pos2(head.max.x, head.max.y + 2.0));
+    let eresp = ui.interact(edge, ui.id().with(("hedge", id.0)), Sense::drag());
+    if eresp.hovered() || eresp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if eresp.drag_stopped()
+        && let Some(p) = ui.ctx().pointer_latest_pos()
+    {
+        let want = (p.y - head.min.y).max(10.0);
+        let best = TrackHeight::ALL.into_iter().min_by_key(|h| ((h.points() - want).abs() * 10.0) as i64).unwrap_or(TrackHeight::Medium);
+        if best != track.height {
+            let _ = app.run("track.height", json!({"tracks": [id.0], "height": best.label()}));
+        }
+    }
     let x0 = head.min.x + 12.0;
     let h = head.height();
     // Click on header background selects the track.
@@ -741,11 +756,42 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         track.name.clone()
     };
     ui.painter().with_clip_rect(name_r).text(name_r.center(), Align2::CENTER_CENTER, &shown_name, bold(12.0), t.text_dark);
-    let nresp = ui.interact(name_r, ui.id().with(("name", id.0)), Sense::click());
+    let nresp = ui.interact(name_r, ui.id().with(("name", id.0)), Sense::click_and_drag());
     if nresp.double_clicked() {
         app.dialogs.open_rename_track(id, &track.name);
     } else if nresp.clicked() {
         let _ = app.run("edit.select", json!({"tracks": [id.0]}));
+    }
+    // Drag the name plate to reorder tracks.
+    if nresp.dragged()
+        && let Some(p) = ui.ctx().pointer_latest_pos()
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let line_y = app
+            .edit_layout
+            .rows
+            .iter()
+            .map(|(_, r)| r[1])
+            .chain(app.edit_layout.rows.last().map(|(_, r)| r[3]))
+            .min_by_key(|y| ((y - p.y).abs() * 10.0) as i64)
+            .unwrap_or(p.y);
+        ui.ctx()
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("reorder")))
+            .line_segment([pos2(head.min.x, line_y), pos2(head.max.x + 600.0, line_y)], Stroke::new(3.0, Tokens::DARK.accent));
+    }
+    if nresp.drag_stopped()
+        && let Some(p) = ui.ctx().pointer_latest_pos()
+    {
+        let rows = app.edit_layout.rows.clone();
+        let target_row = rows.iter().position(|(_, r)| p.y < (r[1] + r[3]) * 0.5).unwrap_or(rows.len());
+        // Convert the visible-row index to a session index.
+        let s = app.engine.session();
+        let to = rows.get(target_row).and_then(|(tid, _)| s.track_index(TrackId(*tid))).unwrap_or(s.tracks.len());
+        let from = s.track_index(id).unwrap_or(0);
+        let to = if to > from { to - 1 } else { to };
+        if to != from {
+            let _ = app.run("track.move", json!({"track": id.0, "to": to}));
+        }
     }
     // Playlist selector arrow.
     let pl_r = Rect::from_min_size(pos2(name_r.max.x + 3.0, name_r.min.y), vec2(16.0, 17.0));
