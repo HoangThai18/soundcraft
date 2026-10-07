@@ -59,28 +59,68 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let x0 = r.min.x + 4.0;
     let views = app.ui.mix_views.clone();
     let has = |v: &str| views.iter().any(|x| x == v);
-    // Inserts A-E.
-    if has("inserts_ae") {
+    let all = has("all");
+    for (key, title, off, is_send) in [
+        ("inserts_ae", "INSERTS A-E", 0usize, false),
+        ("inserts_fj", "INSERTS F-J", 5, false),
+        ("sends_ae", "SENDS A-E", 0, true),
+        ("sends_fj", "SENDS F-J", 5, true),
+    ] {
+        if !(all || has(key)) {
+            continue;
+        }
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
         ui.painter().rect_filled(sec, 2.0, t.strip_section);
-        section_label(ui, sec, "INSERTS A-E");
-        for slot in 0..5 {
-            let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + slot as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
-            insert_slot(app, ui, &track, slot, sr);
+        section_label(ui, sec, title);
+        for k in 0..5 {
+            let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + k as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
+            if is_send {
+                send_slot(app, ui, &track, off + k, sr);
+            } else {
+                insert_slot(app, ui, &track, off + k, sr);
+            }
         }
         y = sec.max.y + 4.0;
     }
-    if has("sends_ae") {
-        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
-        ui.painter().rect_filled(sec, 2.0, t.strip_section);
-        section_label(ui, sec, "SENDS A-E");
-        for slot in 0..5 {
-            let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + slot as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
-            send_slot(app, ui, &track, slot, sr);
+    if all || has("eq_curve") {
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 40.0));
+        ui.painter().rect_filled(sec, 2.0, Color32::from_rgb(14, 18, 22));
+        let eq = track.mixer.inserts.iter().flatten().find(|i| i.plugin == "eq_7band" || i.plugin == "eq_1band");
+        if let Some(ins) = eq {
+            let n = 40;
+            let freqs: Vec<f32> = (0..n).map(|i| 20.0 * 1000f32.powf(i as f32 / (n - 1) as f32)).collect();
+            let params: Vec<(&str, f32)> = ins.params.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+            let resp = if ins.plugin == "eq_7band" {
+                soundcraft_dsp::eq7_response(&params, &freqs, 48_000.0)
+            } else {
+                soundcraft_dsp::eq1_response(&params, &freqs, 48_000.0)
+            };
+            let pts: Vec<egui::Pos2> = resp
+                .iter()
+                .enumerate()
+                .map(|(i, db)| {
+                    pos2(sec.min.x + sec.width() * i as f32 / (n - 1) as f32, sec.center().y - db.clamp(-18.0, 18.0) / 18.0 * sec.height() * 0.45)
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5, t.counter_text)));
+        } else {
+            ui.painter().line_segment(
+                [pos2(sec.min.x + 2.0, sec.center().y), pos2(sec.max.x - 2.0, sec.center().y)],
+                Stroke::new(1.0, Color32::from_rgb(60, 70, 80)),
+            );
         }
         y = sec.max.y + 4.0;
     }
-    if has("io") {
+    if all || has("comments") {
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 44.0));
+        let mut c = track.comments.clone();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sec));
+        if child.add(egui::TextEdit::multiline(&mut c).desired_width(inner_w).desired_rows(2).hint_text("comments").font(regular(10.0))).changed() {
+            let _ = app.engine.execute("track.comments", &json!({"track": id.0, "comments": c}));
+        }
+        y = sec.max.y + 4.0;
+    }
+    if all || has("io") {
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 2.0 * 18.0 + 30.0));
         ui.painter().rect_filled(sec, 2.0, t.strip_section);
         section_label(ui, sec, "I / O");
@@ -270,10 +310,9 @@ fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: R
     } else {
         ui.painter().with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, label, regular(10.5), t.text);
     }
-    if resp.clicked() && ins.is_some()
-        && !app.ui.plugin_windows.contains(&(id, slot)) {
-            app.ui.plugin_windows.push((id, slot));
-        }
+    if resp.clicked() && ins.is_some() && !app.ui.plugin_windows.contains(&(id, slot)) {
+        app.ui.plugin_windows.push((id, slot));
+    }
     let menu_resp = if ins.is_none() { resp.clone() } else { resp.clone().on_hover_text("Click: open plugin · right-click: change") };
     let popup = if ins.is_none() { egui::Popup::menu(&menu_resp) } else { egui::Popup::context_menu(&menu_resp) };
     popup.show(|ui| plugin_menu(app, ui, id, slot, ins.is_some()));

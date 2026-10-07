@@ -67,7 +67,13 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let Some((track, clip)) = app.engine.session().find_clip(cid).map(|(t, c)| (t, c.clone())) else { return };
     let ClipContent::Midi { sequence } = &clip.content else { return };
     let track_color = app.engine.session().track(track).map_or([120, 120, 200], |t| t.color);
-    ui.painter().text(pos2(header.min.x + 110.0, header.center().y), Align2::LEFT_CENTER, format!("{} · {} notes · click: add · drag: move · edge: resize · Delete: remove", clip.name, sequence.notes.len()), regular(11.0), t.text_dim);
+    ui.painter().text(
+        pos2(header.min.x + 110.0, header.center().y),
+        Align2::LEFT_CENTER,
+        format!("{} · {} notes · click: add · drag: move · edge: resize · Delete: remove", clip.name, sequence.notes.len()),
+        regular(11.0),
+        t.text_dim,
+    );
     let s = app.engine.session().clone();
     let sr = s.sample_rate;
     let base_tick = s.tempo.samples_to_ticks(clip.start, sr);
@@ -117,7 +123,13 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let key = Rect::from_min_size(pos2(keys.min.x, y), vec2(KEY_W - 2.0, ROW_H - 1.0));
         painter.rect_filled(key, 1.0, if is_black(pitch) { Color32::from_rgb(20, 20, 20) } else { Color32::from_rgb(225, 225, 225) });
         if pitch.rem_euclid(12) == 0 && (0..=127).contains(&pitch) {
-            painter.text(pos2(key.max.x - 3.0, key.center().y), Align2::RIGHT_CENTER, soundcraft_midi::note_name(pitch as u8), regular(8.0), Color32::from_rgb(40, 40, 40));
+            painter.text(
+                pos2(key.max.x - 3.0, key.center().y),
+                Align2::RIGHT_CENTER,
+                soundcraft_midi::note_name(pitch as u8),
+                regular(8.0),
+                Color32::from_rgb(40, 40, 40),
+            );
             painter.line_segment([pos2(roll.min.x, y + ROW_H), pos2(roll.max.x, y + ROW_H)], Stroke::new(1.0, Color32::from_rgb(64, 64, 68)));
         }
     }
@@ -127,7 +139,10 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let bar = tick % (TICKS_PER_QUARTER * 4) == 0;
         let x = x_of(tick);
         if grid_ticks as f32 * px_per_tick > 4.0 || bar {
-            painter.line_segment([pos2(x, roll.min.y), pos2(x, roll.max.y)], Stroke::new(1.0, if bar { Color32::from_rgb(80, 80, 86) } else { Color32::from_rgb(50, 50, 54) }));
+            painter.line_segment(
+                [pos2(x, roll.min.y), pos2(x, roll.max.y)],
+                Stroke::new(1.0, if bar { Color32::from_rgb(80, 80, 86) } else { Color32::from_rgb(50, 50, 54) }),
+            );
         }
         tick += grid_ticks;
     }
@@ -151,14 +166,21 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let r = Rect::from_min_max(pos2(x_of(st), y_of(p) + 1.0), pos2(x_of(st + ln).max(x_of(st) + 3.0), y_of(p) + ROW_H - 1.0));
         let sel = app.midi.selected.contains(&i);
         let k = 0.45 + 0.55 * f32::from(n.velocity) / 127.0;
-        let fill = if sel { Color32::WHITE } else { Color32::from_rgb((f32::from(base.r()) * k) as u8, (f32::from(base.g()) * k) as u8, (f32::from(base.b()) * k) as u8) };
+        let fill = if sel {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb((f32::from(base.r()) * k) as u8, (f32::from(base.g()) * k) as u8, (f32::from(base.b()) * k) as u8)
+        };
         painter.rect(r, 2.0, fill, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
     }
     // Interaction.
     let resp = ui.interact(roll, ui.id().with(("roll", cid.0)), Sense::click_and_drag());
     let hit = |pos: egui::Pos2| -> Option<(usize, bool)> {
         sequence.notes.iter().enumerate().rev().find_map(|(i, n)| {
-            let r = Rect::from_min_max(pos2(x_of(n.start), y_of(i32::from(n.pitch))), pos2(x_of(n.start + n.length).max(x_of(n.start) + 3.0), y_of(i32::from(n.pitch)) + ROW_H));
+            let r = Rect::from_min_max(
+                pos2(x_of(n.start), y_of(i32::from(n.pitch))),
+                pos2(x_of(n.start + n.length).max(x_of(n.start) + 3.0), y_of(i32::from(n.pitch)) + ROW_H),
+            );
             r.contains(pos).then_some((i, pos.x > r.max.x - 5.0))
         })
     };
@@ -207,7 +229,10 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             None => {
                 let pitch = (top - ((p.y - roll.min.y) / ROW_H).floor() as i32).clamp(0, 127);
                 let start = (((p.x - roll.min.x) / px_per_tick) as i64 / grid_ticks) * grid_ticks;
-                let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": start.max(0), "length_ticks": grid_ticks, "velocity": 100}));
+                let _ = app.run(
+                    "midi.note_add",
+                    json!({"clip": cid.0, "pitch": pitch, "start_ticks": start.max(0), "length_ticks": grid_ticks, "velocity": 100}),
+                );
                 app.midi.selected.clear();
             }
         }

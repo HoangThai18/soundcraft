@@ -14,7 +14,10 @@ pub const COLUMN_W: f32 = 112.0;
 /// Optional Edit-window columns (View › Edit Window Views) that are switched on.
 pub fn edit_columns(s: &Session) -> Vec<&'static str> {
     let all = s.edit.flag("edit_view.all");
-    ["io", "inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "comments"].into_iter().filter(|c| all || s.edit.flag(&format!("edit_view.{c}"))).collect()
+    ["io", "inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "comments"]
+        .into_iter()
+        .filter(|c| all || s.edit.flag(&format!("edit_view.{c}")))
+        .collect()
 }
 
 pub fn header_width(s: &Session) -> f32 {
@@ -49,7 +52,12 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     egui::Panel::bottom("edit_status").exact_size(22.0).frame(egui::Frame::NONE.fill(t.toolbar_bg)).show(ui, |ui| status_bar(app, ui));
     egui::Panel::bottom("lower_dock_tabs").exact_size(22.0).frame(egui::Frame::NONE.fill(t.panel_bg2)).show(ui, |ui| dock_tabs(app, ui));
     if app.ui.show_midi_editor {
-        egui::Panel::bottom("midi_editor").resizable(true).default_size(320.0).min_size(260.0).frame(egui::Frame::NONE.fill(t.panel_bg)).show(ui, |ui| crate::midi_editor::show(app, ui));
+        egui::Panel::bottom("midi_editor")
+            .resizable(true)
+            .default_size(320.0)
+            .min_size(260.0)
+            .frame(egui::Frame::NONE.fill(t.panel_bg))
+            .show(ui, |ui| crate::midi_editor::show(app, ui));
     }
     if app.ui.show_tracks_list {
         egui::Panel::left("tracks_list")
@@ -67,7 +75,11 @@ fn dock_tabs(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::DARK;
     let r = ui.max_rect();
     let mut x = r.min.x + 10.0;
-    for (label, on, id) in [("MIDI EDITOR", app.ui.show_midi_editor, "window.midi_editor"), ("MEMORY LOCATIONS", app.ui.show_memory_locations, "window.memory_locations"), ("UNDO HISTORY", app.ui.show_undo_history, "window.undo_history")] {
+    for (label, on, id) in [
+        ("MIDI EDITOR", app.ui.show_midi_editor, "window.midi_editor"),
+        ("MEMORY LOCATIONS", app.ui.show_memory_locations, "window.memory_locations"),
+        ("UNDO HISTORY", app.ui.show_undo_history, "window.undo_history"),
+    ] {
         let g = ui.painter().layout_no_wrap(label.to_string(), bold(10.5), if on { Color32::WHITE } else { t.text_dim });
         let tr = Rect::from_min_size(pos2(x, r.min.y + 2.0), vec2(g.size().x + 16.0, r.height() - 4.0));
         if on {
@@ -251,6 +263,20 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
         match id.as_str() {
             "tempo" => {
                 painter.rect_filled(row.shrink2(vec2(0.0, 1.0)), 0.0, t.tempo_ruler);
+                let tresp = ui.interact(row, ui.id().with("tempo_ruler"), Sense::click());
+                if tresp.double_clicked()
+                    && let Some(p) = tresp.interact_pointer_pos()
+                {
+                    let at = snap(&s, sample_at(&s, tl, p.x).max(0));
+                    let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(at, sr));
+                    app.dialogs.open = Some(crate::dialogs::Dialog::Number {
+                        cmd: format!("event.tempo@{at}"),
+                        title: "Tempo Change (BPM)".into(),
+                        key: "bpm".into(),
+                        value: bpm,
+                        suffix: "bpm".into(),
+                    });
+                }
                 for ev in s.tempo.tempos() {
                     let x = x_of(&s, tl, s.tempo.tick_to_samples(ev.tick, sr));
                     painter.add(Shape::convex_polygon(
@@ -549,6 +575,13 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
             }
         }
     });
+    if track.is_folder() {
+        let fr = Rect::from_min_size(pos2(head.min.x + 6.0, name_r.min.y), vec2(10.0, 17.0));
+        icons::draw(ui.painter(), fr, if track.folder_open { "triangle_down" } else { "triangle_right" }, t.text);
+        if ui.interact(fr, ui.id().with(("fold", id.0)), Sense::click()).clicked() {
+            let _ = app.run("track.folder_toggle", json!({"track": id.0}));
+        }
+    }
     let kind_label = match track.kind {
         TrackKind::Audio => "",
         TrackKind::Aux => "AUX",
@@ -673,14 +706,28 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
         "inserts_ae" | "inserts_fj" => {
             let off = if col == "inserts_ae" { 0 } else { 5 };
             for i in 0..5.min(rows) {
-                let name = track.mixer.inserts.get(off + i).cloned().flatten().and_then(|x| soundcraft_dsp::plugin_info(&x.plugin).map(|p| p.name)).unwrap_or("");
+                let name = track
+                    .mixer
+                    .inserts
+                    .get(off + i)
+                    .cloned()
+                    .flatten()
+                    .and_then(|x| soundcraft_dsp::plugin_info(&x.plugin).map(|p| p.name))
+                    .unwrap_or("");
                 text(ui, item(i), name, t.text);
             }
         }
         "sends_ae" | "sends_fj" => {
             let off = if col == "sends_ae" { 0 } else { 5 };
             for i in 0..5.min(rows) {
-                let s = track.mixer.sends.get(off + i).cloned().flatten().map(|x| format!("{} {:.0}", route(&x.target), x.level_db.max(-99.0))).unwrap_or_default();
+                let s = track
+                    .mixer
+                    .sends
+                    .get(off + i)
+                    .cloned()
+                    .flatten()
+                    .map(|x| format!("{} {:.0}", route(&x.target), x.level_db.max(-99.0)))
+                    .unwrap_or_default();
                 text(ui, item(i), &s, t.text);
             }
         }
@@ -909,6 +956,27 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                     if selected { Color32::from_rgb(16, 16, 16) } else { vcol },
                 );
             }
+        }
+    }
+    // Clip gain line.
+    let show_gain = s.edit.flag("view.clip.gain_line") && (!clip.gain_env.is_empty() || clip.gain_db.abs() > 0.01 || track.view == "clip_gain");
+    if show_gain && body_r.height() > 12.0 {
+        let gy = |db: f32| body_r.max.y - 3.0 - ((db.clamp(-36.0, 36.0) + 36.0) / 72.0) * (body_r.height() - 6.0);
+        let col = Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+        if clip.gain_env.is_empty() {
+            painter.line_segment([pos2(x0, gy(clip.gain_db)), pos2(x1, gy(clip.gain_db))], Stroke::new(1.0, col));
+        } else {
+            let mut pts = vec![pos2(x0, gy(clip.gain_db + clip.gain_env.first().map_or(0.0, |p| p.1)))];
+            for (o, db) in &clip.gain_env {
+                let p = pos2(x_of(s, tl, clip.start + o), gy(clip.gain_db + db));
+                pts.push(p);
+                painter.circle_filled(p, 2.5, col);
+            }
+            pts.push(pos2(x1, gy(clip.gain_db + clip.gain_env.last().map_or(0.0, |p| p.1))));
+            painter.add(Shape::line(pts, Stroke::new(1.0, col)));
+        }
+        if s.edit.flag("view.clip.gain_info") || clip.gain_db.abs() > 0.01 {
+            painter.text(pos2(r.max.x - 4.0, body_r.max.y - 8.0), Align2::RIGHT_CENTER, format!("{:+.1} dB", clip.gain_db), regular(9.5), col);
         }
     }
     // Fades.

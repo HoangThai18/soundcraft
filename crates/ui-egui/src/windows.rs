@@ -17,6 +17,9 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     midi_keyboard(app, ctx);
     workspace(app, ctx);
     configurations(app, ctx);
+    playback_engine(app, ctx);
+    io_setup(app, ctx);
+    shortcuts_window(app, ctx);
 }
 
 fn win(ctx: &egui::Context, open: &mut bool, title: &str, size: egui::Vec2, body: impl FnOnce(&mut egui::Ui)) {
@@ -32,7 +35,15 @@ fn automation(app: &mut SoundApp, ctx: &egui::Context) {
         ui.label("Write automation for the selected tracks:");
         let tracks = app.engine.session().edit.selected_tracks.clone();
         ui.horizontal_wrapped(|ui| {
-            for m in [AutomationMode::Off, AutomationMode::Read, AutomationMode::Touch, AutomationMode::Latch, AutomationMode::TouchLatch, AutomationMode::Write, AutomationMode::Trim] {
+            for m in [
+                AutomationMode::Off,
+                AutomationMode::Read,
+                AutomationMode::Touch,
+                AutomationMode::Latch,
+                AutomationMode::TouchLatch,
+                AutomationMode::Write,
+                AutomationMode::Trim,
+            ] {
                 if ui.button(m.label()).clicked() {
                     let ids: Vec<u64> = tracks.iter().map(|t| t.0).collect();
                     let _ = app.run("mix.automation_mode", json!({"tracks": ids, "mode": m.label()}));
@@ -112,7 +123,9 @@ fn task_manager(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_task_manager;
     win(ctx, &mut open, "Task Manager", vec2(320.0, 120.0), |ui| {
         ui.label("No background tasks are running.");
-        ui.label(egui::RichText::new("Renders, bounces and AudioSuite processes run to completion before returning.").small().color(Tokens::DARK.text_dim));
+        ui.label(
+            egui::RichText::new("Renders, bounces and AudioSuite processes run to completion before returning.").small().color(Tokens::DARK.text_dim),
+        );
     });
     app.ui.show_task_manager = open;
 }
@@ -131,7 +144,10 @@ fn metadata(app: &mut SoundApp, ctx: &egui::Context) {
                 ("Clips", s.tracks.iter().map(|t| t.clips().len()).sum::<usize>().to_string()),
                 ("Audio files", s.sources.len().to_string()),
                 ("Markers", s.markers.len().to_string()),
-                ("Length", soundcraft_time::format_position(s.content_end(), soundcraft_time::TimeFormat::MinSecs, s.sample_rate, &s.tempo, s.frame_rate, 0)),
+                (
+                    "Length",
+                    soundcraft_time::format_position(s.content_end(), soundcraft_time::TimeFormat::MinSecs, s.sample_rate, &s.tempo, s.frame_rate, 0),
+                ),
             ] {
                 ui.label(k);
                 ui.label(v);
@@ -251,15 +267,20 @@ fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
         });
         ui.separator();
         let mut entries: Vec<(String, bool)> = std::fs::read_dir(&dir)
-            .map(|rd| rd.flatten().filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    return None;
-                }
-                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-                let ext = std::path::Path::new(&name).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
-                (is_dir || ["wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "caf", "mid", "midi", "scraft"].contains(&ext.as_str())).then_some((name, is_dir))
-            }).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.starts_with('.') {
+                            return None;
+                        }
+                        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                        let ext = std::path::Path::new(&name).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+                        (is_dir || ["wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "caf", "mid", "midi", "scraft"].contains(&ext.as_str()))
+                            .then_some((name, is_dir))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -315,4 +336,93 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
         }
     });
     app.ui.show_configurations = open;
+}
+
+/// Setup › Playback Engine / Hardware.
+pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_playback_engine;
+    win(ctx, &mut open, "Playback Engine", vec2(380.0, 220.0), |ui| {
+        egui::Grid::new("pe").num_columns(2).show(ui, |ui| {
+            ui.label("Output device");
+            ui.label(app.player.as_ref().map_or("none".to_string(), |p| p.device_name.clone()));
+            ui.end_row();
+            ui.label("Device rate");
+            ui.label(app.player.as_ref().map_or("-".to_string(), |p| format!("{} Hz", p.device_rate)));
+            ui.end_row();
+            ui.label("Session rate");
+            ui.label(format!("{} Hz", app.engine.session().sample_rate.hz()));
+            ui.end_row();
+            ui.label("Input device");
+            ui.label(
+                app.recorder
+                    .as_ref()
+                    .map_or("opened on first record".to_string(), |r| format!("{} ({} ch @ {} Hz)", r.device_name, r.channels, r.sample_rate)),
+            );
+            ui.end_row();
+            ui.label("Mix block size");
+            ui.label("512 samples (resampled to the device rate when they differ)");
+            ui.end_row();
+        });
+        let mut dc = app.engine.session().edit.delay_compensation;
+        if ui.checkbox(&mut dc, "Delay compensation").changed() {
+            let _ = app.run("options.delay_compensation", json!({"value": dc}));
+        }
+        if ui.button("Reconnect audio device").clicked() {
+            app.player = Some(soundcraft_playback::Player::new(app.engine.session_arc()));
+        }
+    });
+    app.ui.show_playback_engine = open;
+}
+
+/// Setup › I/O: busses and output paths.
+pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_io_setup;
+    win(ctx, &mut open, "I/O Setup", vec2(420.0, 300.0), |ui| {
+        ui.label(egui::RichText::new("Busses").strong());
+        let busses: Vec<(String, String)> = app.engine.session().busses.iter().map(|b| (b.name.clone(), b.format.label().to_string())).collect();
+        egui::Grid::new("busses").num_columns(3).striped(true).show(ui, |ui| {
+            for (name, fmt) in busses {
+                let key = egui::Id::new(("bus_name", name.clone()));
+                let mut edit: String = ui.ctx().memory(|m| m.data.get_temp(key)).unwrap_or_else(|| name.clone());
+                let r = ui.text_edit_singleline(&mut edit);
+                ui.ctx().memory_mut(|m| m.data.insert_temp(key, edit.clone()));
+                if r.lost_focus() && edit != name {
+                    let _ = app.run("mix.bus_rename", json!({"bus": name, "name": edit}));
+                }
+                ui.label(fmt);
+                if ui.small_button("Delete").clicked() {
+                    let _ = app.run("mix.bus_delete", json!({"bus": name}));
+                }
+                ui.end_row();
+            }
+        });
+        if ui.button("New Bus").clicked() {
+            let n = app.engine.session().busses.len() + 1;
+            let _ = app.run("mix.new_bus", json!({"name": format!("Bus {n}")}));
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Outputs").strong());
+        for o in app.engine.session().outputs.clone() {
+            ui.label(format!("{} — {} from channel {}", o.name, o.format.label(), o.first_channel + 1));
+        }
+    });
+    app.ui.show_io_setup = open;
+}
+
+/// Setup › Keyboard Shortcuts.
+pub fn shortcuts_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_shortcuts;
+    win(ctx, &mut open, "Keyboard Shortcuts", vec2(520.0, 480.0), |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("sc").num_columns(3).striped(true).show(ui, |ui| {
+                for c in soundcraft_engine::command_specs().iter().filter(|c| c.shortcut.is_some()) {
+                    ui.label(egui::RichText::new(c.shortcut.unwrap_or("")).font(mono(11.0)));
+                    ui.label(c.label);
+                    ui.label(egui::RichText::new(c.menu.join(" › ")).small());
+                    ui.end_row();
+                }
+            });
+        });
+    });
+    app.ui.show_shortcuts = open;
 }
