@@ -29,6 +29,8 @@ pub struct MeterSnapshot {
 
 enum Cmd {
     Session(Arc<Session>),
+    Input(Arc<record::InputRing>),
+    Recording(bool),
     Play { from: Samples, end: Option<Samples>, looped: Option<Range> },
     Stop,
     Locate(Samples),
@@ -58,6 +60,8 @@ struct AudioState {
     pending_len: usize,
     read: f64,
     device_rate: f64,
+    input: Option<Arc<record::InputRing>>,
+    recording: bool,
 }
 
 impl AudioState {
@@ -77,12 +81,16 @@ impl AudioState {
             pending_len: 0,
             read: 0.0,
             device_rate,
+            input: None,
+            recording: false,
         }
     }
 
     fn drain(&mut self) {
         while let Ok(c) = self.rx.try_recv() {
             match c {
+                Cmd::Input(r) => self.input = Some(r),
+                Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s) => {
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         self.mix = MixEngine::new(s.sample_rate.as_f64() as f32, BLOCK);
@@ -138,6 +146,15 @@ impl AudioState {
             self.pending_len = BLOCK;
             return;
         }
+        if let Some(ring) = &self.input {
+            let ch = ring.channels.load(Ordering::Relaxed).max(1);
+            if self.mix.input.len() != ch {
+                self.mix.input = vec![vec![0.0; BLOCK]; ch];
+            }
+            ring.pop_into(&mut self.mix.input, n);
+        }
+        self.mix.monitor_only = !self.playing;
+        self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.block);
         for (d, s) in self.pending.iter_mut().zip(self.block.iter()) {
             if let (Some(dd), Some(ss)) = (d.get_mut(..n), s.get(..n)) {
@@ -145,6 +162,9 @@ impl AudioState {
             }
         }
         self.pending_len = n;
+        if !self.playing {
+            return;
+        }
         self.pos += n as i64;
         self.shared.position.store(self.pos, Ordering::Relaxed);
         if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -159,7 +179,8 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        if !self.playing {
+        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 m.main = StripMeter::default();
@@ -172,7 +193,7 @@ impl AudioState {
         for frame in out.chunks_mut(channels) {
             while self.read >= self.pending_len as f64 {
                 self.read -= self.pending_len as f64;
-                if !self.playing {
+                if !self.playing && !monitoring {
                     break;
                 }
                 self.render_next();
@@ -186,7 +207,7 @@ impl AudioState {
                 let ch = self.pending.get(c.min(1));
                 let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
                 let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
-                *o = if c < 2 && self.playing { (a + (b - a) * fr).clamp(-1.0, 1.0) } else { 0.0 };
+                *o = if c < 2 && (self.playing || monitoring) { (a + (b - a) * fr).clamp(-1.0, 1.0) } else { 0.0 };
             }
             self.read += step;
         }
@@ -300,6 +321,15 @@ impl Player {
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Play { from, end, looped });
+    }
+
+    /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
+    pub fn set_input(&self, ring: Arc<record::InputRing>) {
+        let _ = self.tx.send(Cmd::Input(ring));
+    }
+
+    pub fn set_recording(&self, on: bool) {
+        let _ = self.tx.send(Cmd::Recording(on));
     }
 
     pub fn stop(&self) {
