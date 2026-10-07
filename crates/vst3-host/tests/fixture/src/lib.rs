@@ -4,7 +4,9 @@
 //!   (connected through IConnectionPoint, synced through the component state). Params: 7 "Gain"
 //!   (plain 0..2, linear, units dB), 3 "Mode" (3 steps: A/B/C), 12 "Freq" (20..20000 Hz, log),
 //!   9 hidden, 11 bypass. Starts at gain 0.5 (its state) although the declared default is 1.0.
-//!   Reports 3 samples of latency.
+//!   Reports 3 samples of latency. State: the component stores the gain (one LE f64), the
+//!   controller the Freq value (one LE f64). Its controller has an editor view (`IPlugView`,
+//!   320×240, no real drawing) supporting NSView/HWND/X11.
 //! - "Fixture Synth" (`Instrument|Synth`): a single-component instrument (the component is also
 //!   its edit controller). No audio input, one stereo output, one event input; every output
 //!   sample is the velocity of the held note (sample-accurate), 0 when none.
@@ -117,7 +119,18 @@ impl IComponentTrait for GainProcessor {
     unsafe fn setActive(&self, _state: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+    unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
+        let mut bytes = [0u8; 8];
+        let mut n = 0;
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } != kResultOk || n != 8 {
+            return kResultFalse;
+        }
+        let g = f64::from_le_bytes(bytes);
+        if !(0.0..=1.0).contains(&g) {
+            return kResultFalse;
+        }
+        self.gain.store(g.to_bits(), Ordering::Relaxed);
         kResultOk
     }
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
@@ -195,6 +208,62 @@ impl IAudioProcessorTrait for GainProcessor {
 
 struct GainController {
     gain: AtomicU64,
+    freq: AtomicU64,
+}
+
+struct View {
+    attached: std::sync::atomic::AtomicBool,
+}
+
+impl Class for View {
+    type Interfaces = (IPlugView,);
+}
+
+impl IPlugViewTrait for View {
+    unsafe fn isPlatformTypeSupported(&self, t: FIDString) -> tresult {
+        let t = unsafe { std::ffi::CStr::from_ptr(t) }.to_bytes();
+        if t == b"NSView" || t == b"HWND" || t == b"X11EmbedWindowID" { kResultTrue } else { kResultFalse }
+    }
+    unsafe fn attached(&self, parent: *mut c_void, _t: FIDString) -> tresult {
+        if parent.is_null() {
+            return kInvalidArgument;
+        }
+        self.attached.store(true, Ordering::Relaxed);
+        kResultOk
+    }
+    unsafe fn removed(&self) -> tresult {
+        assert!(self.attached.swap(false, Ordering::Relaxed), "removed without attached");
+        kResultOk
+    }
+    unsafe fn onWheel(&self, _d: f32) -> tresult {
+        kResultFalse
+    }
+    unsafe fn onKeyDown(&self, _k: char16, _c: i16, _m: i16) -> tresult {
+        kResultFalse
+    }
+    unsafe fn onKeyUp(&self, _k: char16, _c: i16, _m: i16) -> tresult {
+        kResultFalse
+    }
+    unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
+        let r = unsafe { &mut *size };
+        *r = ViewRect { left: 0, top: 0, right: 320, bottom: 240 };
+        kResultOk
+    }
+    unsafe fn onSize(&self, _s: *mut ViewRect) -> tresult {
+        kResultOk
+    }
+    unsafe fn onFocus(&self, _s: TBool) -> tresult {
+        kResultOk
+    }
+    unsafe fn setFrame(&self, _f: *mut IPlugFrame) -> tresult {
+        kResultOk
+    }
+    unsafe fn canResize(&self) -> tresult {
+        kResultFalse
+    }
+    unsafe fn checkSizeConstraint(&self, _r: *mut ViewRect) -> tresult {
+        kResultOk
+    }
 }
 
 impl Class for GainController {
@@ -240,11 +309,20 @@ impl IEditControllerTrait for GainController {
         }
         kResultOk
     }
-    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+    unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
+        let mut bytes = [0u8; 8];
+        let mut n = 0;
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
+            self.freq.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
         kResultOk
     }
-    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+    unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
+        let mut bytes = f64::from_bits(self.freq.load(Ordering::Relaxed)).to_le_bytes();
+        let mut n = 0;
+        unsafe { s.write(bytes.as_mut_ptr().cast(), 8, &mut n) }
     }
     unsafe fn getParameterCount(&self) -> i32 {
         GAIN_PARAMS.len() as i32
@@ -293,13 +371,15 @@ impl IEditControllerTrait for GainController {
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
         match id {
             7 => f64::from_bits(self.gain.load(Ordering::Relaxed)),
-            12 => 0.5,
+            12 => f64::from_bits(self.freq.load(Ordering::Relaxed)),
             _ => 0.0,
         }
     }
     unsafe fn setParamNormalized(&self, id: u32, v: f64) -> tresult {
         if id == 7 {
             self.gain.store(v.to_bits(), Ordering::Relaxed);
+        } else if id == 12 {
+            self.freq.store(v.to_bits(), Ordering::Relaxed);
         }
         kResultOk
     }
@@ -312,8 +392,14 @@ impl IEditControllerTrait for GainController {
         }
         kResultOk
     }
-    unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
-        std::ptr::null_mut()
+    unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
+        if name.is_null() || unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() != b"editor" {
+            return std::ptr::null_mut();
+        }
+        match ComWrapper::new(View { attached: std::sync::atomic::AtomicBool::new(false) }).to_com_ptr::<IPlugView>() {
+            Some(p) => p.into_raw(),
+            None => std::ptr::null_mut(),
+        }
     }
 }
 
@@ -534,7 +620,7 @@ impl IPluginFactoryTrait for Factory {
         let unknown = if cid == GAIN_CID {
             ComWrapper::new(GainProcessor { gain: AtomicU64::new(0.25f64.to_bits()), arrangement: AtomicU64::new(SpeakerArr::kStereo) }).to_com_ptr::<FUnknown>()
         } else if cid == GAIN_CTRL_CID {
-            ComWrapper::new(GainController { gain: AtomicU64::new(0.5f64.to_bits()) }).to_com_ptr::<FUnknown>()
+            ComWrapper::new(GainController { gain: AtomicU64::new(0.5f64.to_bits()), freq: AtomicU64::new(0.5f64.to_bits()) }).to_com_ptr::<FUnknown>()
         } else if cid == SYNTH_CID {
             ComWrapper::new(Synth { level: AtomicU32::new(0) }).to_com_ptr::<FUnknown>()
         } else {

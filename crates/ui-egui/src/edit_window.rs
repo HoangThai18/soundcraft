@@ -645,6 +645,7 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
         }
         draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
     }
+    crate::video_track::draw_lane(app, &painter, &s, &track, tl, lane);
     if let Some(p) = &auto_view {
         draw_automation(&painter, &s, &track, p, tl, lane);
     }
@@ -829,6 +830,7 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         TrackKind::Instrument => "INST",
         TrackKind::Vca => "VCA",
         TrackKind::Folder => "FOLDER",
+        TrackKind::Video => "VIDEO",
     };
     if !kind_label.is_empty() {
         ui.painter().text(pos2(pl_r.max.x + 4.0, name_r.center().y), Align2::LEFT_CENTER, kind_label, bold(9.0), t.text_dim);
@@ -1174,6 +1176,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 painter.text(body_r.center(), Align2::CENTER_CENTER, "media offline", regular(10.0), Color32::from_rgb(220, 120, 120));
             }
         }
+        ClipContent::Video { .. } => {} // thumbnails: video_track::draw_lane
         ClipContent::Midi { sequence } => {
             let (lo, hi) = sequence.notes.iter().fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.pitch), hi.max(n.pitch)));
             let (lo, hi) = if lo > hi { (48, 72) } else { (lo.saturating_sub(2), hi.saturating_add(2)) };

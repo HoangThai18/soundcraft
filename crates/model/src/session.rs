@@ -2,7 +2,7 @@
 
 use crate::{
     Bus, BusId, ChannelFormat, Clip, ClipId, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
-    TRACK_COLORS, Track, TrackId, TrackKind,
+    TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
 };
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
@@ -291,6 +291,9 @@ pub struct Session {
     pub key_signatures: Vec<(Samples, String)>,
     pub tracks: Vec<Track>,
     pub sources: Vec<Source>,
+    /// Movies referenced by Video track clips.
+    #[serde(default)]
+    pub videos: Vec<VideoSource>,
     pub busses: Vec<Bus>,
     pub outputs: Vec<OutputPath>,
     pub markers: Vec<MemoryLocation>,
@@ -328,6 +331,7 @@ impl Session {
             key_signatures: Vec::new(),
             tracks: Vec::new(),
             sources: Vec::new(),
+            videos: Vec::new(),
             busses: Vec::new(),
             outputs: vec![OutputPath { name: "Out 1-2".into(), first_channel: 0, format: ChannelFormat::Stereo }],
             markers: Vec::new(),
@@ -369,6 +373,9 @@ impl Session {
     }
     pub fn source(&self, id: SourceId) -> Option<&Source> {
         self.sources.iter().find(|s| s.id == id)
+    }
+    pub fn video(&self, id: SourceId) -> Option<&VideoSource> {
+        self.videos.iter().find(|v| v.id == id)
     }
     pub fn bus(&self, id: BusId) -> Option<&Bus> {
         self.busses.iter().find(|b| b.id == id)
@@ -497,6 +504,7 @@ impl Session {
             .map(|t| t.id.0)
             .chain(self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))))
             .chain(self.sources.iter().map(|s| s.id.0))
+            .chain(self.videos.iter().map(|v| v.id.0))
             .chain(self.busses.iter().map(|b| b.id.0))
             .chain(self.markers.iter().map(|m| m.id.0))
             .chain(self.groups.iter().map(|g| g.id.0))
@@ -528,6 +536,14 @@ impl Session {
             for l in &mut t.automation {
                 l.points.retain(|p| p.value.is_finite());
                 l.points.sort_by_key(|p| p.at);
+            }
+        }
+        for v in &mut self.videos {
+            if !v.frame_rate.is_finite() || v.frame_rate < 0.0 {
+                v.frame_rate = 0.0;
+            }
+            if !v.duration.is_finite() || v.duration < 0.0 {
+                v.duration = 0.0;
             }
         }
         // Drop performances whose clip no longer exists anywhere (any playlist).
@@ -571,6 +587,41 @@ mod tests {
         let text = s.to_json().unwrap();
         let back = Session::from_json(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn video_clip_round_trips_and_old_sessions_load() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Video, ChannelFormat::Mono, None);
+        let vid = SourceId(s.alloc());
+        s.videos.push(VideoSource {
+            id: vid,
+            name: "cut.mov".into(),
+            path: "/films/cut.mov".into(),
+            width: 1920,
+            height: 1080,
+            frame_rate: 23.976,
+            duration: 12.5,
+            codec: "prores".into(),
+        });
+        let cid = s.new_clip_id();
+        if let Some(p) = s.track_mut(t).and_then(Track::playlist_mut) {
+            p.clips.push(Clip::video(cid, "cut", vid, 480, 0, 600_000));
+        }
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back, s);
+        let c = &back.track(t).unwrap().clips()[0];
+        assert_eq!((c.video_source(), c.source(), c.source_offset(), c.is_audio()), (Some(vid), None, 480, false));
+        assert_eq!(back.track(t).unwrap().kind.label(), "Video Track");
+        assert!(back.video(vid).is_some());
+        // A session written before video support has no `videos` key.
+        let mut v = serde_json::to_value(Session::default()).unwrap();
+        v.as_object_mut().unwrap().remove("videos");
+        assert!(Session::from_json(&v.to_string()).unwrap().videos.is_empty());
+        // Trimming the start keeps the picture anchored.
+        let mut c = c.clone();
+        c.trim_start_to(100);
+        assert_eq!(c.source_offset(), 580);
     }
 
     #[test]

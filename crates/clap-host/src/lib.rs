@@ -17,7 +17,13 @@
 //!
 //! On `wasm32` the crate compiles to stubs: scans are empty and nothing can be created.
 //!
-//! Plugin GUIs (`clap.gui`) are not hosted yet; SoundCraft shows its generic parameter editor.
+//! Plugin state (`clap.state`) round-trips through [`Plugin::save_state`] /
+//! [`Plugin::load_state`] as an opaque blob. Plugin editors (`clap.gui`) open as the plugin's own
+//! floating window ([`Plugin::open_editor`], or [`Plugin::editor`] for a handle usable on the main
+//! thread while the instance processes on the audio thread); plugins that offer only embedded
+//! editors are not hosted yet, and SoundCraft's generic parameter editor still works for them.
+//! Parameter changes made in the plugin's GUI arrive as output events while the plugin processes
+//! and are reported by the editor's `idle`.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

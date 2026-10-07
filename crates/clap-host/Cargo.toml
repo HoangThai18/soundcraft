@@ -13,6 +13,10 @@ serde.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
+[[test]]
+name = "editor_main_thread"
+harness = false
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap-sys = "0.5"
 libloading = "0.8"

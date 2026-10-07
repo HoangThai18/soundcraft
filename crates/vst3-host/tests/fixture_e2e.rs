@@ -3,44 +3,9 @@
 //! notes.
 
 use soundcraft_dsp::{Category, Taper, Unit};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
 
-/// Builds the fixture once and returns a folder containing `Fixture.vst3`.
-fn fixture_dir() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/Cargo.toml");
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("vst3-fixture-target");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let st = Command::new(cargo)
-            .args(["build", "--quiet", "--manifest-path"])
-            .arg(&manifest)
-            .arg("--target-dir")
-            .arg(&target)
-            .env_remove("RUSTFLAGS")
-            .status()
-            .expect("run cargo");
-        assert!(st.success(), "building the VST3 fixture failed");
-        let (lib, folder, exe) = if cfg!(target_os = "macos") {
-            ("libvst3_fixture.dylib", "MacOS", "Fixture")
-        } else if cfg!(windows) {
-            ("vst3_fixture.dll", "x86_64-win", "Fixture.vst3")
-        } else {
-            ("libvst3_fixture.so", if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
-        };
-        let built = target.join("debug").join(lib);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("vst3-fixture-install-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // Install as a real bundle to exercise bundle resolution and the module entry.
-        let bin = dir.join("vendor/Fixture.vst3/Contents").join(folder);
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::copy(&built, bin.join(exe)).unwrap();
-        assert_eq!(soundcraft_vst3_host::add_search_dir(&dir), 2);
-        dir
-    })
-}
+mod common;
+use common::fixture_dir;
 
 fn id_of(name: &str) -> String {
     let found = soundcraft_vst3_host::scan_paths(&[fixture_dir().to_path_buf()]);
@@ -205,4 +170,60 @@ fn installed_plugins_smoke() {
             Err(e) => eprintln!("  instantiate: {e}"),
         }
     }
+}
+
+#[test]
+fn state_saves_component_and_controller_and_restores_them() {
+    let id = id_of("Fixture Gain");
+    let mut p = soundcraft_vst3_host::create(&id).unwrap();
+    p.prepare(48_000.0, 64, 2);
+    assert!(p.set_param("7", 1.5));
+    let mut io = vec![vec![0.5f32; 64]; 2];
+    p.process(&mut io, 64);
+    let blob = p.save_state().expect("component state");
+    assert!(blob.starts_with(b"SCV3"));
+    let mut q = soundcraft_vst3_host::create(&id).unwrap();
+    q.prepare(48_000.0, 64, 2);
+    assert_eq!(q.param("7"), Some(0.5));
+    assert!(q.load_state(&blob));
+    assert_eq!(q.param("7"), Some(1.5), "controller synced from the restored component state");
+    let mut io = vec![vec![0.5f32; 64]; 2];
+    q.process(&mut io, 64);
+    assert!(io[0].iter().all(|&x| (x - 0.75).abs() < 1e-6), "{:?}", &io[0][..4]);
+    // The controller part (Freq) round-trips too: write one by hand.
+    let mut custom = b"SCV3".to_vec();
+    custom.extend_from_slice(&8u32.to_le_bytes());
+    custom.extend_from_slice(&0.25f64.to_le_bytes());
+    custom.extend_from_slice(&8u32.to_le_bytes());
+    custom.extend_from_slice(&1.0f64.to_le_bytes());
+    assert!(q.load_state(&custom));
+    assert_eq!(q.param("7"), Some(0.5));
+    assert!((q.param("12").unwrap() - 20_000.0).abs() < 1.0, "{:?}", q.param("12"));
+    // A bare component state is accepted; hostile blobs are refused.
+    assert!(q.load_state(&0.5f64.to_le_bytes()));
+    assert_eq!(q.param("7"), Some(1.0));
+    for bad in [&b""[..], b"SCV3", b"SCV3\xff\xff\xff\xff", &[0xffu8; 8][..], b"abc"] {
+        assert!(!q.load_state(bad), "{bad:?}");
+    }
+    assert_eq!(q.param("7"), Some(1.0));
+}
+
+#[test]
+fn editor_view_is_probed_and_edits_come_back_as_plain_values() {
+    let id = id_of("Fixture Gain");
+    let mut p = soundcraft_vst3_host::instantiate_plugin(&id).unwrap();
+    assert_eq!(p.editor_size(), Ok((320, 240)));
+    let mut ed = soundcraft_dsp::Plugin::editor(&mut p).expect("editor handle");
+    // The fixture "edits" Gain to 0.9 (normalized) when it gets the component handler.
+    assert_eq!(ed.idle(), vec![("7".to_string(), 1.8)]);
+    assert!(ed.idle().is_empty());
+    if cfg!(target_os = "macos") {
+        assert!(ed.open().unwrap_err().contains("main thread"), "test threads are not the main thread");
+    } else {
+        assert!(ed.open().is_err(), "unsupported elsewhere");
+    }
+    assert!(!ed.is_open());
+    // The synth's controller has no view.
+    let synth = soundcraft_vst3_host::instantiate_plugin(&id_of("Fixture Synth")).unwrap();
+    assert!(synth.editor_size().is_err());
 }

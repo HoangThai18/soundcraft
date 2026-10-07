@@ -1,8 +1,10 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
-use crate::ffi::{BusBuffers, EVENT_CAP, Instance, NoteEvent, PARAM_QUEUE_CAP};
-use soundcraft_dsp::{Plugin, PluginInfo, Unit};
+use crate::ffi::{BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Unit};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use vst3::ComWrapper;
 
 /// Largest block we set a plugin up for.
 const MAX_BLOCK: usize = 1 << 16;
@@ -123,6 +125,26 @@ impl Vst3Plugin {
             Mapping::Linear => linear,
         };
         n.is_finite().then(|| n.clamp(0.0, 1.0))
+    }
+
+    /// The editor's size in pixels without opening it (creates and releases a view). For
+    /// diagnostics and tests; real plugins expect this on the main thread.
+    pub fn editor_size(&self) -> Result<(u32, u32), String> {
+        self.inst.editor().ok_or_else(|| "this plugin has no edit controller".to_string())?.probe()
+    }
+
+    /// Re-reads every parameter value from the controller (after a state load) and drops
+    /// changes still queued from before it.
+    fn refresh_values(&mut self) {
+        for i in 0..self.ids.len() {
+            let (Some(pi), Some(&id)) = (self.info.params.get(i), self.ids.get(i)) else { continue };
+            if let Some(v) = self.inst.normalized_value(id).and_then(|n| self.plain_from_normalized(i, n))
+                && let Some(slot) = self.values.get_mut(i)
+            {
+                *slot = pi.clamp(v);
+            }
+        }
+        self.pending.clear();
     }
 
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
@@ -293,6 +315,104 @@ impl Plugin for Vst3Plugin {
             if self.held.get(k as usize).copied().unwrap_or(false) {
                 self.note_off(0, k);
             }
+        }
+    }
+
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self.inst.save_state()
+    }
+
+    fn load_state(&mut self, data: &[u8]) -> bool {
+        let ok = self.inst.load_state(data);
+        if ok {
+            self.refresh_values();
+        }
+        ok
+    }
+
+    fn open_editor(&mut self) -> Result<(), String> {
+        self.inst.editor().ok_or_else(|| "this plugin has no editor".to_string())?.open(self.info.name)
+    }
+
+    fn close_editor(&mut self) {
+        if let Some(e) = self.inst.editor() {
+            e.close();
+        }
+    }
+
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        let link = self.inst.editor()?;
+        Some(Box::new(Vst3Editor { link, host: self.inst.host_ref(), info: self.info, ids: self.ids.clone(), maps: self.maps.clone() }))
+    }
+}
+
+/// A VST3 plugin's editor (`IPlugView` in a host window), driven from the main thread.
+struct Vst3Editor {
+    link: Arc<EditorLink>,
+    host: ComWrapper<HostContext>,
+    info: &'static PluginInfo,
+    ids: Vec<u32>,
+    maps: Vec<Mapping>,
+}
+
+impl Vst3Editor {
+    fn plain(&self, i: usize, n: f64) -> Option<f32> {
+        let pi = self.info.params.get(i)?;
+        let id = *self.ids.get(i)?;
+        let v = match self.maps.get(i)? {
+            Mapping::Stepped(steps) => (n * steps).round(),
+            Mapping::Plain => self.link.to_plain(id, n)?,
+            Mapping::Linear => f64::from(pi.min) + n * f64::from(pi.max - pi.min),
+        };
+        v.is_finite().then(|| pi.clamp(v as f32))
+    }
+
+    fn normalized(&self, i: usize, v: f32) -> Option<f64> {
+        let pi = self.info.params.get(i)?;
+        let id = *self.ids.get(i)?;
+        let span = f64::from(pi.max - pi.min);
+        let linear = if span > 0.0 { (f64::from(v) - f64::from(pi.min)) / span } else { 0.0 };
+        let n = match self.maps.get(i)? {
+            Mapping::Stepped(steps) if *steps > 0.0 => f64::from(v) / steps,
+            Mapping::Stepped(_) => 0.0,
+            Mapping::Plain => self.link.to_normalized(id, f64::from(v)).unwrap_or(linear),
+            Mapping::Linear => linear,
+        };
+        n.is_finite().then(|| n.clamp(0.0, 1.0))
+    }
+}
+
+impl PluginEditor for Vst3Editor {
+    fn open(&mut self) -> Result<(), String> {
+        // Edits reported before the editor opened (e.g. during setup) are stale.
+        let _ = self.host.take_edits();
+        self.link.open(self.info.name)
+    }
+
+    fn close(&mut self) {
+        self.link.close();
+    }
+
+    fn is_open(&self) -> bool {
+        self.link.is_open()
+    }
+
+    fn idle(&mut self) -> Vec<(String, f32)> {
+        self.link.idle();
+        let mut out = Vec::new();
+        for (vid, n) in self.host.take_edits() {
+            let Some(i) = self.ids.iter().position(|&x| x == vid) else { continue };
+            if let (Some(p), Some(v)) = (self.info.params.get(i), self.plain(i, n)) {
+                out.push((p.id.to_string(), v));
+            }
+        }
+        out
+    }
+
+    fn set_param(&mut self, id: &str, value: f32) {
+        let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return };
+        if let (Some(&vid), Some(n)) = (self.ids.get(i), self.normalized(i, value)) {
+            self.link.set_normalized(vid, n);
         }
     }
 }

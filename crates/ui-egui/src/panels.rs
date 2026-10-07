@@ -393,6 +393,23 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                         let _ = app.run("mix.insert_bypass", json!({"track": tid.0, "slot": slot}));
                     }
                     ui.menu_button("Presets ▾", |ui| preset_menu(app, ui, tid, slot, info, &ins));
+                    if soundcraft_mix::is_third_party(&ins.plugin) {
+                        let open = app.player.as_ref().is_some_and(|p| p.editor_open(tid, slot));
+                        let available = app.player.as_ref().is_some_and(|p| p.has_editor(tid, slot));
+                        let label = if open { "Close Plugin Editor" } else { "Open Plugin Editor" };
+                        let resp = ui.add_enabled(available, egui::Button::new(label));
+                        let resp =
+                            if available { resp } else { resp.on_disabled_hover_text("This plugin has no editor of its own, or it is not loaded") };
+                        if resp.clicked()
+                            && let Some(p) = &app.player
+                        {
+                            if open {
+                                p.close_editor(tid, slot);
+                            } else if let Err(e) = p.open_editor(tid, slot) {
+                                app.ui.status = format!("{}: {e}", info.name);
+                            }
+                        }
+                    }
                 });
                 if info.id == "eq_7band" || info.id == "eq_1band" {
                     eq_curve(ui, info.id, &ins);
@@ -426,6 +443,10 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                 &json!({"track": tid.0, "slot": slot, "param": p.id, "value": x}),
                                 &format!("param:{}:{slot}:{}", tid.0, p.id),
                             );
+                            if let Some(pl) = &app.player {
+                                // Keep the plugin's own editor in step.
+                                pl.editor_set_param(tid, slot, p.id, x);
+                            }
                         }
                         let _ = resp;
                         ui.label(egui::RichText::new(p.format(x)).font(mono(11.0)));

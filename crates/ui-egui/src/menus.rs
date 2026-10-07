@@ -24,6 +24,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
     ("window.universe", "Universe", "View > Other Displays > Universe", None),
+    ("window.video", "Video", "Window > Video", Some("Cmd+9")),
+    ("window.video_universe", "Video Universe", "Window > Video Universe", None),
     ("window.automation", "Automation", "Window > Automation", Some("Cmd+4")),
     ("window.color_palette", "Color Palette", "Window > Color Palette", None),
     ("window.disk_usage", "Disk Usage", "Window > Disk Usage", None),
@@ -40,6 +42,9 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.configurations", "Window Configuration List", "Window > Configurations > Window Configuration List", None),
     ("window.config_new", "New Configuration", "Window > Configurations > New Configuration...", None),
     ("window.config_update", "Update Active Configuration", "Window > Configurations > Update Active Configuration", None),
+    ("window.config_auto_update", "Auto-Update Active Configuration", "Window > Configurations > Auto-Update Active Configuration", None),
+    ("window.renderer", "Renderer", "Window > Renderer", None),
+    ("window.ui_customization", "UI Customization", "Window > UI Customization", None),
     ("window.arrange_tile", "Tile", "Window > Arrange > Tile", None),
     ("window.arrange_tile_h", "Tile Horizontal", "Window > Arrange > Tile Horizontal", None),
     ("window.arrange_tile_v", "Tile Vertical", "Window > Arrange > Tile Vertical", None),
@@ -267,6 +272,9 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("window.track_list") => app.ui.show_tracks_list,
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
+        Some("window.renderer") => app.extra.show_renderer,
+        Some("window.ui_customization") => app.extra.show_ui_customization,
+        Some("window.config_auto_update") => app.extra.auto_update_config,
         Some("view.mix_section") => path.rsplit(" > ").next().map(mix_section_id).is_some_and(|s| app.ui.mix_views.iter().any(|v| v == s)),
         _ => false,
     }
@@ -374,6 +382,9 @@ fn wants_dialog(id: &str) -> bool {
 
 /// Handle UI-layer commands. Returns None when `id` is not a UI command.
 pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
+    if let Some(v) = crate::extra_windows::run(app, id, p) {
+        return Some(Ok(v));
+    }
     let toggle = |v: &mut bool| {
         *v = p.get("value").and_then(Value::as_bool).unwrap_or(!*v);
         json!({"value": *v})
@@ -452,6 +463,8 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             json!({})
         }
         "window.universe" => toggle(&mut app.ui.show_universe),
+        "window.video" => toggle(&mut app.ui.show_video),
+        "window.video_universe" => toggle(&mut app.ui.show_video_universe),
         "window.close" | "window.hide_floating" => {
             app.ui.show_transport = false;
             app.ui.show_big_counter = false;

@@ -319,6 +319,10 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
                         let total = s.source(source).map_or(0, |src| i64::try_from(src.frames).unwrap_or(i64::MAX));
                         total.saturating_sub(offset).saturating_sub(c.length)
                     }
+                    ClipContent::Video { source, offset } => {
+                        let total = s.video(source).map_or(0, |v| s.sample_rate.samples(v.duration.clamp(0.0, 1e7)));
+                        total.saturating_sub(offset).saturating_sub(c.length)
+                    }
                     ClipContent::Midi { .. } => 0,
                 };
                 (c.id, avail)

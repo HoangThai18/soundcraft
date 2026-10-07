@@ -7,6 +7,7 @@
 pub mod control;
 pub mod dialogs;
 pub mod edit_window;
+pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
 pub mod menus;
@@ -19,6 +20,8 @@ pub mod score_editor;
 pub mod shortcuts;
 pub mod theme;
 pub mod toolbar;
+pub mod video_track;
+pub mod video_window;
 pub mod widgets;
 pub mod windows;
 
@@ -84,6 +87,10 @@ pub struct UiState {
     pub show_rtp: bool,
     pub show_score: bool,
     pub show_search: bool,
+    /// Window › Video, Window › Video Universe, timecode burn-in in the Video window.
+    pub show_video: bool,
+    pub show_video_universe: bool,
+    pub video_burn_in: bool,
     pub workspace_dir: String,
     pub configurations: Vec<(String, Value)>,
 }
@@ -129,6 +136,9 @@ impl Default for UiState {
             show_rtp: false,
             show_score: false,
             show_search: false,
+            show_video: false,
+            show_video_universe: false,
+            video_burn_in: false,
             workspace_dir: String::new(),
             configurations: Vec::new(),
         }
@@ -198,6 +208,7 @@ pub struct SoundApp {
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
     pub ops: ops_windows::OpsState,
+    pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
     pub synthetic: Vec<egui::Event>,
     synthetic_grace: u32,
@@ -216,6 +227,8 @@ pub struct SoundApp {
     last_write_at: Samples,
     pub frame_ms: f32,
     last_frame: Option<f64>,
+    /// Movies for the Video window and Video track (decoded in the background).
+    pub video: video_track::VideoPool,
 }
 
 impl SoundApp {
@@ -239,6 +252,7 @@ impl SoundApp {
             edit_layout: edit_window::EditLayout::default(),
             midi: midi_editor::MidiEditorState::default(),
             ops: ops_windows::OpsState::default(),
+            extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
             synthetic: Vec::new(),
             synthetic_grace: 0,
@@ -254,6 +268,7 @@ impl SoundApp {
             last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
+            video: video_track::VideoPool::default(),
         }
     }
 
@@ -266,6 +281,10 @@ impl SoundApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
+        }
+        if id.starts_with("session.save") || id.starts_with("file.bounce") {
+            // Third-party plugins keep state the session can't see: store it first.
+            self.capture_plugin_states();
         }
         match self.engine.execute(id, &params) {
             Ok(v) => {
@@ -362,6 +381,31 @@ impl SoundApp {
         }
     }
 
+    /// Reads every live third-party plugin's state from the audio engine and stores it on its
+    /// insert (`mix.insert_state`), so saves and bounces include it.
+    pub fn capture_plugin_states(&mut self) {
+        let Some(p) = &self.player else { return };
+        for (t, slot, data) in p.capture_states() {
+            let slot = if slot == soundcraft_mix::INSTRUMENT_SLOT { json!("instrument") } else { json!(slot) };
+            let state = soundcraft_model::b64::encode(&data);
+            if let Err(e) = self.engine.execute("mix.insert_state", &json!({"track": t.0, "slot": slot, "state": state})) {
+                log::warn!("storing plugin state: {e}");
+            }
+        }
+    }
+
+    /// Parameter edits made in plugin editors go into the session (one undo step per gesture).
+    fn apply_editor_edits(&mut self) {
+        let Some(p) = &self.player else { return };
+        for (t, slot, param, value) in p.idle() {
+            if slot == soundcraft_mix::INSTRUMENT_SLOT {
+                continue;
+            }
+            let key = format!("param:{}:{slot}:{param}", t.0);
+            let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
+        }
+    }
+
     /// Every two minutes, copy a modified session to the autosave folder (not while recording).
     fn autosave(&mut self, now: f64) {
         let Some(dir) = self.autosave_dir.clone() else { return };
@@ -372,6 +416,7 @@ impl SoundApp {
             return;
         }
         self.last_autosave = now;
+        self.capture_plugin_states();
         let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
         let path = dir.join(&name).join(format!("{name}.scraft"));
         if let Some(parent) = path.parent() {
@@ -645,6 +690,7 @@ impl SoundApp {
         self.last_frame = Some(now);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
+        self.apply_editor_edits();
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
@@ -727,7 +773,9 @@ impl SoundApp {
         }
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
+        video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
+        extra_windows::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);

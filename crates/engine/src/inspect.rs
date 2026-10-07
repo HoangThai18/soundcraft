@@ -21,6 +21,10 @@ fn clip_json(e: &Engine, c: &Clip) -> Value {
         ClipContent::Midi { sequence } => {
             v["notes"] = json!(sequence.notes.len());
         }
+        ClipContent::Video { source, offset } => {
+            v["video"] = json!(source);
+            v["offset"] = json!(offset);
+        }
     }
     if !c.gain_env.is_empty() {
         v["gain_envelope"] = json!(c.gain_env);

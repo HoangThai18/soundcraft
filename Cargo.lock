@@ -1687,6 +1687,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3373,6 +3375,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-au-host"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "soundcraft-dsp",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-audio-io"
 version = "0.1.0"
 dependencies = [
@@ -3443,6 +3455,7 @@ dependencies = [
  "soundcraft-mix",
  "soundcraft-model",
  "soundcraft-time",
+ "soundcraft-video",
  "soundcraft-vst3-host",
  "thiserror 2.0.21",
 ]
@@ -3463,6 +3476,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "rayon",
+ "soundcraft-au-host",
  "soundcraft-audio-io",
  "soundcraft-clap-host",
  "soundcraft-dsp",
@@ -3518,6 +3532,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "soundcraft-au-host",
  "soundcraft-audio-io",
  "soundcraft-clap-host",
  "soundcraft-dsp",
@@ -3527,7 +3542,19 @@ dependencies = [
  "soundcraft-model",
  "soundcraft-playback",
  "soundcraft-time",
+ "soundcraft-video",
  "soundcraft-vst3-host",
+]
+
+[[package]]
+name = "soundcraft-video"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "proptest",
+ "rayon",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3536,6 +3563,9 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "serde",
  "soundcraft-dsp",
  "thiserror 2.0.21",

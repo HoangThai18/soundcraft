@@ -14,11 +14,21 @@ pub enum TrackKind {
     Instrument,
     Vca,
     Folder,
+    /// Picture: clips reference a movie ([`crate::VideoSource`]); no audio path.
+    Video,
 }
 
 impl TrackKind {
-    pub const ALL: [TrackKind; 7] =
-        [TrackKind::Audio, TrackKind::Aux, TrackKind::Master, TrackKind::Midi, TrackKind::Instrument, TrackKind::Vca, TrackKind::Folder];
+    pub const ALL: [TrackKind; 8] = [
+        TrackKind::Audio,
+        TrackKind::Aux,
+        TrackKind::Master,
+        TrackKind::Midi,
+        TrackKind::Instrument,
+        TrackKind::Vca,
+        TrackKind::Folder,
+        TrackKind::Video,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             TrackKind::Audio => "Audio Track",
@@ -28,6 +38,7 @@ impl TrackKind {
             TrackKind::Instrument => "Instrument Track",
             TrackKind::Vca => "VCA Master",
             TrackKind::Folder => "Routing Folder Track",
+            TrackKind::Video => "Video Track",
         }
     }
     pub fn default_name(self) -> &'static str {
@@ -39,6 +50,7 @@ impl TrackKind {
             TrackKind::Instrument => "Inst",
             TrackKind::Vca => "VCA",
             TrackKind::Folder => "Folder",
+            TrackKind::Video => "Video",
         }
     }
     pub fn id(self) -> &'static str {
@@ -50,6 +62,7 @@ impl TrackKind {
             TrackKind::Instrument => "instrument",
             TrackKind::Vca => "vca",
             TrackKind::Folder => "folder",
+            TrackKind::Video => "video",
         }
     }
     pub fn from_id(s: &str) -> Option<TrackKind> {
@@ -58,7 +71,7 @@ impl TrackKind {
     }
     /// Track kinds that hold clips on a timeline.
     pub fn has_playlist(self) -> bool {
-        matches!(self, TrackKind::Audio | TrackKind::Midi | TrackKind::Instrument)
+        matches!(self, TrackKind::Audio | TrackKind::Midi | TrackKind::Instrument | TrackKind::Video)
     }
     pub fn is_midi(self) -> bool {
         matches!(self, TrackKind::Midi | TrackKind::Instrument)

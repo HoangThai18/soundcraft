@@ -20,9 +20,22 @@
 //!
 //! On `wasm32` the crate compiles to stubs: scans are empty and nothing can be created.
 //!
-//! Not hosted yet: plugin editors (`IPlugView`), `IMessage`/`IAttributeList` creation through the
-//! host (plugins that need it for processor ↔ controller messaging may lose those messages),
-//! plugin state save/restore, sidechain (aux buses are kept inactive) and 64-bit processing.
+//! Plugin state: [`Plugin::save_state`] stores the component state and the controller state in
+//! one blob (`SCV3` + length-prefixed parts); [`Plugin::load_state`] restores both (a bare
+//! component state is accepted too) and re-reads the parameter values.
+//!
+//! Plugin editors (`IPlugView`): on macOS the view is attached to the content `NSView` of a host
+//! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`).
+//! [`Plugin::open_editor`] opens it directly; [`Plugin::editor`] returns a handle usable on the
+//! main thread while the instance processes on the audio thread (VST3's own threading model:
+//! the controller and its views live on the UI thread). Parameter edits made in the editor
+//! (`IComponentHandler::performEdit`) are reported by the handle's `idle` so the host can write
+//! them into the session. Windows (HWND) and Linux (X11) editor windows are not hosted yet:
+//! opening reports "unsupported".
+//!
+//! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
+//! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
+//! inactive) and 64-bit processing.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -183,6 +196,13 @@ pub fn load_bundle(path: &Path) -> Result<Vec<Vst3Descriptor>, Vst3Error> {
 /// `soundcraft_dsp::create`), with the reason when it fails.
 pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
     api::instantiate(id)
+}
+
+/// Like [`instantiate`], but returns the concrete [`Vst3Plugin`] (for its extra methods, such
+/// as [`Vst3Plugin::editor_size`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
+    registry::instantiate_plugin(id)
 }
 
 /// Creates a plugin by `vst3:<class id>`; `None` if unknown or it fails to load.

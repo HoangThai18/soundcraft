@@ -20,12 +20,14 @@ mod midi;
 mod mix;
 mod more_util;
 mod options;
+mod plugin_state;
 mod query;
 mod setup_more;
 mod surround;
 mod track;
 mod track_more;
 mod transport;
+mod video;
 mod view;
 mod view_more;
 mod vst3;
@@ -116,6 +118,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(clap::specs());
         v.extend(vst3::specs());
         v.extend(surround::specs());
+        v.extend(plugin_state::specs());
+        v.extend(video::specs());
         v
     })
 }

@@ -4,12 +4,19 @@
 //!   (stepped enum A/B/C), hidden param 9, latency 3 samples.
 //! - `org.soundcraft.test.synth`: instrument, stereo out, CLAP note port; outputs a constant equal
 //!   to the velocity of the held note (0 when none), switching at the event's sample offset.
+//!
+//! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
+//! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
+//! reported as an output parameter event by the next `process`.
 #![allow(clippy::missing_safety_doc, non_upper_case_globals)]
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
+use clap_sys::ext::gui::*;
+use clap_sys::ext::state::*;
+use clap_sys::stream::*;
 use clap_sys::ext::latency::*;
 use clap_sys::ext::log::*;
 use clap_sys::ext::note_ports::*;
@@ -63,6 +70,9 @@ struct Fx {
     level: f64,
     active: bool,
     processing: bool,
+    gui_created: bool,
+    gui_visible: bool,
+    gui_edit_pending: bool,
 }
 
 unsafe fn fx<'a>(p: *const clap_plugin) -> &'a mut Fx {
@@ -87,6 +97,7 @@ unsafe extern "C" fn init(p: *const clap_plugin) -> bool {
 }
 
 unsafe extern "C" fn destroy(p: *const clap_plugin) {
+    assert!(!unsafe { fx(p) }.gui_created, "plugin destroyed with its GUI alive");
     let data = unsafe { (*p).plugin_data } as *mut Fx;
     drop(unsafe { Box::from_raw(data) });
 }
@@ -165,6 +176,44 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         }
         Some(unsafe { &*pr.audio_inputs })
     };
+    if f.gui_edit_pending {
+        f.gui_edit_pending = false;
+        f.gain = 0.25;
+        let e = clap_event_param_value {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id: 7,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value: 0.25,
+        };
+        let out = unsafe { &*pr.out_events };
+        assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &e.header) });
+        // Other event types are accepted and ignored by the host.
+        let note = clap_event_note {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_note>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_NOTE_END,
+                flags: 0,
+            },
+            note_id: -1,
+            port_index: 0,
+            channel: 0,
+            key: 60,
+            velocity: 0.0,
+        };
+        assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &note.header) });
+    }
     let mut next = 0u32;
     let mut last_time = 0u32;
     for i in 0..n {
@@ -311,6 +360,112 @@ unsafe extern "C" fn notes_get(_p: *const clap_plugin, index: u32, is_input: boo
 
 static NOTES: clap_plugin_note_ports = clap_plugin_note_ports { count: Some(notes_count), get: Some(notes_get) };
 
+unsafe extern "C" fn state_save(p: *const clap_plugin, stream: *const clap_ostream) -> bool {
+    let f = unsafe { fx(p) };
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&f.gain.to_le_bytes());
+    bytes[8..].copy_from_slice(&f.mode.to_le_bytes());
+    let s = unsafe { &*stream };
+    // Write in two pieces to exercise appending.
+    let a = unsafe { (s.write.unwrap())(stream, bytes.as_ptr().cast(), 5) };
+    let b = unsafe { (s.write.unwrap())(stream, bytes[5..].as_ptr().cast(), 11) };
+    a == 5 && b == 11
+}
+
+unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istream) -> bool {
+    let f = unsafe { fx(p) };
+    let s = unsafe { &*stream };
+    let mut bytes = [0u8; 17];
+    let mut got = 0usize;
+    loop {
+        let n = unsafe { (s.read.unwrap())(stream, bytes[got..].as_mut_ptr().cast(), (17 - got) as u64) };
+        if n <= 0 {
+            break;
+        }
+        got += n as usize;
+        if got == 17 {
+            break;
+        }
+    }
+    if got != 16 {
+        return false;
+    }
+    let gain = f64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let mode = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if !(0.0..=2.0).contains(&gain) || !(0.0..=2.0).contains(&mode) {
+        return false;
+    }
+    f.gain = gain;
+    f.mode = mode;
+    true
+}
+
+static STATE: clap_plugin_state = clap_plugin_state { save: Some(state_save), load: Some(state_load) };
+
+unsafe extern "C" fn gui_is_api_supported(_p: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+    assert!(!api.is_null());
+    floating
+}
+
+unsafe extern "C" fn gui_create(p: *const clap_plugin, _api: *const c_char, floating: bool) -> bool {
+    let f = unsafe { fx(p) };
+    assert!(floating && !f.gui_created, "create");
+    f.gui_created = true;
+    true
+}
+
+unsafe extern "C" fn gui_destroy(p: *const clap_plugin) {
+    let f = unsafe { fx(p) };
+    assert!(f.gui_created, "destroy without create");
+    f.gui_created = false;
+    f.gui_visible = false;
+}
+
+unsafe extern "C" fn gui_set_scale(_p: *const clap_plugin, scale: f64) -> bool {
+    scale > 0.0
+}
+
+unsafe extern "C" fn gui_suggest_title(p: *const clap_plugin, title: *const c_char) {
+    assert!(unsafe { fx(p) }.gui_created);
+    assert!(!unsafe { CStr::from_ptr(title) }.to_bytes().is_empty());
+}
+
+unsafe extern "C" fn gui_show(p: *const clap_plugin) -> bool {
+    let f = unsafe { fx(p) };
+    assert!(f.gui_created, "show without create");
+    f.gui_visible = true;
+    f.gui_edit_pending = true;
+    // Exercise the host GUI extension.
+    let host = unsafe { &*f.host };
+    let hg = unsafe { (host.get_extension.unwrap())(f.host, CLAP_EXT_GUI.as_ptr()) } as *const clap_host_gui;
+    let hg = unsafe { hg.as_ref() }.expect("host gui extension");
+    assert!(unsafe { (hg.request_resize.unwrap())(f.host, 300, 200) });
+    true
+}
+
+unsafe extern "C" fn gui_hide(p: *const clap_plugin) -> bool {
+    unsafe { fx(p) }.gui_visible = false;
+    true
+}
+
+static GUI: clap_plugin_gui = clap_plugin_gui {
+    is_api_supported: Some(gui_is_api_supported),
+    get_preferred_api: None,
+    create: Some(gui_create),
+    destroy: Some(gui_destroy),
+    set_scale: Some(gui_set_scale),
+    get_size: None,
+    can_resize: None,
+    get_resize_hints: None,
+    adjust_size: None,
+    set_size: None,
+    set_parent: None,
+    set_transient: None,
+    suggest_title: Some(gui_suggest_title),
+    show: Some(gui_show),
+    hide: Some(gui_hide),
+};
+
 unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> *const c_void {
     let id = unsafe { CStr::from_ptr(id) };
     let synth = unsafe { fx(p) }.synth;
@@ -322,6 +477,10 @@ unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> 
         &LATENCY as *const _ as *const c_void
     } else if id == CLAP_EXT_NOTE_PORTS && synth {
         &NOTES as *const _ as *const c_void
+    } else if id == CLAP_EXT_STATE && !synth {
+        &STATE as *const _ as *const c_void
+    } else if id == CLAP_EXT_GUI && !synth {
+        &GUI as *const _ as *const c_void
     } else {
         std::ptr::null()
     }
@@ -374,6 +533,9 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         level: 0.0,
         active: false,
         processing: false,
+        gui_created: false,
+        gui_visible: false,
+        gui_edit_pending: false,
     });
     let raw = Box::into_raw(b);
     unsafe {

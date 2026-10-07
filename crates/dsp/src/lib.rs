@@ -197,6 +197,47 @@ pub trait Plugin: Send {
     fn note_on(&mut self, _offset: usize, _note: u8, _velocity: u8) {}
     fn note_off(&mut self, _offset: usize, _note: u8) {}
     fn all_notes_off(&mut self) {}
+    /// The plugin's complete internal state as an opaque blob (third-party plugins), for saving
+    /// in the session. `None` when the plugin has no state beyond its parameters (built-ins) or
+    /// the plugin refused. May allocate: never call it in steady-state audio processing.
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Restores a blob from [`Plugin::save_state`]. `false` if unsupported or the plugin rejected
+    /// it (the plugin keeps working with its previous state). The data is hostile input.
+    fn load_state(&mut self, _data: &[u8]) -> bool {
+        false
+    }
+    /// Opens the plugin's own editor window (GUI). Main (UI) thread only.
+    fn open_editor(&mut self) -> Result<(), String> {
+        Err("no editor".into())
+    }
+    /// Closes the editor opened with [`Plugin::open_editor`] (no-op when none is open).
+    fn close_editor(&mut self) {}
+    /// A handle to this instance's editor that can be used on the UI thread while the instance
+    /// itself is processing on the audio thread (`None` when the plugin has no editor). The
+    /// handle stays valid after the instance is dropped (its calls then do nothing).
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        None
+    }
+}
+
+/// A plugin's editor (GUI), driven from the main (UI) thread. Obtained from
+/// [`Plugin::editor`]; the plugin instance may meanwhile run on the audio thread (plugin formats
+/// allow GUI calls on the main thread concurrently with processing on the audio thread).
+pub trait PluginEditor: Send {
+    /// Opens (or raises) the editor window. Main thread only; an error says why it can't.
+    fn open(&mut self) -> Result<(), String>;
+    /// Closes the editor window.
+    fn close(&mut self);
+    fn is_open(&self) -> bool;
+    /// Call every UI frame while open: services the plugin's GUI requests, notices a window the
+    /// user closed, and returns parameter edits made in the editor as `(param id, value)` in
+    /// SoundCraft units (ids and ranges of [`PluginInfo::params`]).
+    fn idle(&mut self) -> Vec<(String, f32)>;
+    /// Tells the editor that a parameter changed elsewhere (generic editor, automation), so the
+    /// GUI shows it. Values are in SoundCraft units.
+    fn set_param(&mut self, _id: &str, _value: f32) {}
 }
 
 /// The plugin registry.
@@ -235,4 +276,21 @@ pub fn gain_to_db(g: f32) -> f32 {
         return f32::MAX;
     }
     (20.0 * a.log10()).max(MIN_DB)
+}
+
+#[cfg(test)]
+mod trait_default_tests {
+    use super::*;
+
+    #[test]
+    fn built_ins_have_no_state_or_editor() {
+        for info in plugins() {
+            let mut p = create(info.id).unwrap();
+            assert!(p.save_state().is_none(), "{}", info.id);
+            assert!(!p.load_state(b"anything"), "{}", info.id);
+            assert!(p.open_editor().is_err(), "{}", info.id);
+            p.close_editor();
+            assert!(p.editor().is_none(), "{}", info.id);
+        }
+    }
 }
