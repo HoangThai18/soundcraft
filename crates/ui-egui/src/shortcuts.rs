@@ -1,0 +1,156 @@
+//! Keyboard shortcuts. Most come from the command registry's `shortcut` strings; a few
+//! context-sensitive keys (Space, Enter, F-keys, nudge, Tab) are handled here.
+
+use crate::{MainWindow, SoundApp};
+use egui::{Key, Modifiers};
+use serde_json::json;
+
+/// Parse "Cmd+Shift+X" style strings. Returns None for descriptive ones ("F1-F4", "Plus/Minus").
+pub fn parse(s: &str) -> Option<(Modifiers, Key)> {
+    let mut m = Modifiers::NONE;
+    let mut key = None;
+    for part in s.split('+') {
+        match part.trim() {
+            "Cmd" => m.command = true,
+            "Shift" => m.shift = true,
+            "Alt" => m.alt = true,
+            "Ctrl" => m.ctrl = true,
+            "" => {}
+            k => {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(match k {
+                    "Space" => Key::Space,
+                    "Enter" => Key::Enter,
+                    "Home" => Key::Home,
+                    "End" => Key::End,
+                    "Tab" => Key::Tab,
+                    "[" => Key::OpenBracket,
+                    "]" => Key::CloseBracket,
+                    "," => Key::Comma,
+                    "." => Key::Period,
+                    "/" => Key::Slash,
+                    "'" => Key::Quote,
+                    "=" => Key::Equals,
+                    other => Key::from_name(other)?,
+                });
+            }
+        }
+    }
+    key.map(|k| (m, k))
+}
+
+fn mods_match(want: Modifiers, got: Modifiers) -> bool {
+    want.command == got.command && want.shift == got.shift && want.alt == got.alt && (want.ctrl == got.ctrl || got.mac_cmd)
+}
+
+pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
+    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
+        return;
+    }
+    let events: Vec<(Key, Modifiers)> = ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                _ => None,
+            })
+            .collect()
+    });
+    for (key, mods) in events {
+        if fixed(app, key, mods) {
+            continue;
+        }
+        let hit =
+            soundcraft_engine::command_specs().iter().find(|c| c.shortcut.and_then(parse).is_some_and(|(m, k)| k == key && mods_match(m, mods)));
+        if let Some(c) = hit {
+            let id = c.id;
+            if crate::menus::invoke_shortcut_dialog(app, id) {
+                continue;
+            }
+            let _ = app.run(id, json!({}));
+        }
+    }
+}
+
+/// Keys with context-dependent meaning. Returns true when handled.
+fn fixed(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
+    let plain = !m.command && !m.alt && !m.ctrl && !m.shift;
+    match key {
+        Key::Space if !m.command && !m.alt => {
+            let id = if m.shift { "transport.half_speed" } else { "transport.toggle" };
+            let _ = app.run(id, json!({}));
+            true
+        }
+        Key::Space if m.command => {
+            let _ = app.run("transport.record", json!({}));
+            true
+        }
+        Key::Equals if m.command => {
+            let _ = app.run("window.toggle_mix_edit", json!({}));
+            true
+        }
+        Key::Enter if plain => {
+            let _ = app.run("markers.add", json!({}));
+            true
+        }
+        Key::F1 | Key::F2 | Key::F3 | Key::F4 if plain => {
+            let mode = match key {
+                Key::F1 => "shuffle",
+                Key::F2 => "slip",
+                Key::F3 => "spot",
+                _ => "grid",
+            };
+            let _ = app.run("edit.mode", json!({"mode": mode}));
+            true
+        }
+        Key::F5 | Key::F6 | Key::F7 | Key::F8 | Key::F9 | Key::F10 if plain => {
+            let tool = match key {
+                Key::F5 => "zoom",
+                Key::F6 => "trim",
+                Key::F7 => "selector",
+                Key::F8 => "grabber",
+                Key::F9 => "scrubber",
+                _ => "pencil",
+            };
+            let _ = app.run("edit.tool", json!({"tool": tool}));
+            true
+        }
+        Key::Plus | Key::Minus if !m.command && app.ui.window == MainWindow::Edit => {
+            let dir = if key == Key::Plus { 1 } else { -1 };
+            let _ = app.run("edit.nudge", json!({"direction": dir}));
+            true
+        }
+        Key::Tab if plain || m.alt => {
+            // Tab to next clip boundary (or transient when enabled).
+            let s = app.engine.session();
+            let at = s.edit.selection.start;
+            let back = m.alt;
+            let mut edges: Vec<i64> = s
+                .tracks
+                .iter()
+                .filter(|t| s.edit.selected_tracks.contains(&t.id))
+                .flat_map(|t| t.clips().iter().flat_map(|c| [c.start, c.end()]))
+                .collect();
+            edges.sort_unstable();
+            let next = if back { edges.iter().rev().find(|e| **e < at).copied() } else { edges.iter().find(|e| **e > at).copied() };
+            if let Some(n) = next {
+                let _ = app.run("transport.locate", json!({"at": n}));
+            }
+            true
+        }
+        Key::ArrowUp | Key::ArrowDown if m.ctrl => {
+            let id = if key == Key::ArrowUp { "edit.extend_selection_up" } else { "edit.extend_selection_down" };
+            let _ = app.run(id, json!({}));
+            true
+        }
+        Key::R | Key::T if plain => {
+            // Zoom out / in on the timeline (Commands Focus style).
+            let id = if key == Key::T { "view.zoom_in" } else { "view.zoom_out" };
+            let _ = app.run(id, json!({}));
+            true
+        }
+        _ => false,
+    }
+}

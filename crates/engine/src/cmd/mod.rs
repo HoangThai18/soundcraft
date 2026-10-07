@@ -6,6 +6,7 @@ use soundcraft_model::{ClipId, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::sync::OnceLock;
 
+mod audiosuite;
 mod clip;
 mod edit;
 mod event;
@@ -91,6 +92,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(options::specs());
         v.extend(transport::specs());
         v.extend(query::specs());
+        v.extend(audiosuite::specs());
         v
     })
 }
