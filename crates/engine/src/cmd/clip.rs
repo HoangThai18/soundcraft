@@ -125,6 +125,37 @@ pub fn specs() -> Vec<CommandSpec> {
             elastic
         ),
         cmd!("clip.remove_warp", "Remove Warp", ["Clip"], None, "{clips?}", has_selection, remove_warp),
+        cmd!(
+            "clip.place_source",
+            "Place Audio File",
+            [],
+            None,
+            "{source: id, track?: id|name (default: a new track), at?: position}",
+            always,
+            |e, p| {
+                let src = p
+                    .get("source")
+                    .and_then(Value::as_u64)
+                    .map(soundcraft_model::SourceId)
+                    .ok_or_else(|| bad("clip.place_source", "`source` id required"))?;
+                let at = position_param(e, "clip.place_source", p, "at")?.unwrap_or(e.session().edit.selection.start).max(0);
+                let track = track_param(e, "clip.place_source", p, "track")?;
+                let (name, frames, chans) = e
+                    .session()
+                    .source(src)
+                    .map(|x| (x.name.clone(), i64::try_from(x.frames).unwrap_or(0), usize::from(x.channels)))
+                    .ok_or_else(|| bad("clip.place_source", "no such audio file"))?;
+                let s = e.session_mut();
+                let t = match track {
+                    Some(t) if s.track(t).is_some_and(|x| x.kind == soundcraft_model::TrackKind::Audio) => t,
+                    Some(_) => return Err(bad("clip.place_source", "audio files go on audio tracks")),
+                    None => s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::for_channels(chans.min(2)), Some(&name)),
+                };
+                let id = s.new_clip_id();
+                crate::edit::place_clip(s, t, soundcraft_model::Clip::audio(id, name, src, 0, at, frames.max(1)));
+                Ok(json!({"clip": id, "track": t}))
+            }
+        ),
         cmd!("clip.capture", "Capture...", ["Clip"], Some("Cmd+R"), "{name?}", has_range, |e, p| {
             // Captures the selection as a new whole-file-referencing clip in the clip list (we keep it on the track).
             let name = str_param(p, "name").unwrap_or("Captured").to_string();

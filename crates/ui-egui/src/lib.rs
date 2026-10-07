@@ -144,6 +144,10 @@ pub fn preset_folder_name(plugin: &str) -> String {
     plugin.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
+/// Drag-and-drop payload: an audio file (source id) dragged from the Clip List.
+#[derive(Debug, Clone, Copy)]
+pub struct DragSource(pub u64);
+
 /// Ballistic meter display state per strip.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeterDisplay {
