@@ -19,6 +19,7 @@ pub mod offline;
 mod osc;
 pub mod pan;
 mod params;
+pub mod pitch_detect;
 pub mod plugins;
 pub mod spectrum;
 mod util;
