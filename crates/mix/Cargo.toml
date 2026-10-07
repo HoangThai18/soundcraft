@@ -1,0 +1,19 @@
+[package]
+name = "soundcraft-mix"
+description = "SoundCraft mix engine: renders a session's tracks, plugins, sends, busses and automation to audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+soundcraft-time.workspace = true
+soundcraft-audio-io.workspace = true
+soundcraft-midi.workspace = true
+soundcraft-dsp.workspace = true
+soundcraft-model.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
