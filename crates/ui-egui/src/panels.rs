@@ -53,6 +53,16 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt("groups_scroll").auto_shrink([false, false]).show(ui, |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::hover());
         ui.painter().text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, "<ALL>", regular(11.5).clone(), t.text);
+        let all = ui.interact(r, ui.id().with("group_all"), Sense::click());
+        if all.double_clicked() {
+            let _ = app.run("edit.select_all", json!({}));
+        }
+        all.context_menu(|ui| {
+            if ui.button("New Group…").clicked() {
+                let _ = app.dialogs.open_for_command(&app.engine, "track.group");
+                ui.close();
+            }
+        });
         for (id, letter, name, active, color) in groups {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::click());
             if active {
@@ -69,11 +79,25 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
             if resp.clicked() {
                 let _ = app.run("track.group_toggle", json!({"group": id}));
             }
+            let members: Vec<u64> =
+                app.engine.session().groups.iter().find(|g| g.id.0 == id).map(|g| g.members.iter().map(|m| m.0).collect()).unwrap_or_default();
             if resp.double_clicked() {
-                let members: Vec<u64> =
-                    app.engine.session().groups.iter().find(|g| g.id.0 == id).map(|g| g.members.iter().map(|m| m.0).collect()).unwrap_or_default();
-                let _ = app.run("edit.select", json!({"tracks": members}));
+                let _ = app.run("edit.select", json!({"tracks": members, "exact": true}));
             }
+            resp.context_menu(|ui| {
+                if ui.button("Select Tracks in Group").clicked() {
+                    let _ = app.run("edit.select", json!({"tracks": members, "exact": true}));
+                    ui.close();
+                }
+                if ui.button(if active { "Disable" } else { "Enable" }).clicked() {
+                    let _ = app.run("track.group_toggle", json!({"group": id}));
+                    ui.close();
+                }
+                if ui.button("Delete Group").clicked() {
+                    let _ = app.run("track.ungroup", json!({"group": id}));
+                    ui.close();
+                }
+            });
         }
     });
 }
