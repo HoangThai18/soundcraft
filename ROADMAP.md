@@ -24,7 +24,7 @@ the honest status: what works today, what is missing, and how far we are.
 | Plugins (built-in) | 26 original processors + 2 instruments, AudioSuite offline processing | 45 % | 30 |
 | Third-party plugins (CLAP/VST3/AU) | CLAP hosting (audio, params, latency, notes) in an isolated unsafe crate; no plugin GUIs, no state save, no VST3/AU | 30 % | 30 |
 | MIDI | MIDI/instrument tracks, SMF import/export, MIDI editor (piano roll + velocity), event list, step input, quantize/transpose/velocity/duration ops | 40 % | 30 |
-| Recording | Audio input capture, punch into selection; loop record, QuickPunch, input monitoring with latency compensation missing | 30 % | 20 |
+| Recording | Input capture, punch in/out (selection, on the fly, pre/post-roll), loop record into playlists, input monitoring through the channel strip, autosave and recovery | 60 % | 12 |
 | Elastic Audio / TCE / Beat Detective | Pitch-preserving warp on Elastic tracks, TCE to timeline, conform to tempo, Beat Detective and Identify Beat windows | 40 % | 18 |
 | Video, surround panning, Atmos | Formats modelled; no video track, no surround panner | 5 % | 40 |
 | UI fidelity | Edit + Mix windows, toolbar, rulers, track headers, menus for the whole catalog, floating windows, dialogs | 65 % | 25 |
