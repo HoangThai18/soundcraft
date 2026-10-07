@@ -148,6 +148,38 @@ pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool)
     Ok((bytes, (peak, lufs, true_peak)))
 }
 
+/// Bounce one file per audio/instrument track (each soloed, so its sends and auxes are included)
+/// into `dir`. Returns the written paths.
+pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Result<Vec<String>> {
+    let s = e.session();
+    std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
+    let ext = match opts.format {
+        FileFormat::Aiff => "aif",
+        FileFormat::Flac => "flac",
+        _ => "wav",
+    };
+    let mut out = Vec::new();
+    let stems: Vec<(TrackId, String)> = s
+        .tracks
+        .iter()
+        .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi) && !t.inactive && !t.mixer.mute)
+        .map(|t| (t.id, t.name.clone()))
+        .collect();
+    for (id, name) in stems {
+        let mut solo = s.clone();
+        for t in &mut solo.tracks {
+            t.mixer.solo = t.id == id;
+        }
+        let ch = soundcraft_mix::render_range(&solo, r, 1024);
+        let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
+        let bytes = soundcraft_audio_io::encode(&buf, opts).map_err(|err| EngineError::Io(err.to_string()))?;
+        let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
+        std::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+        out.push(path.to_string_lossy().into_owned());
+    }
+    Ok(out)
+}
+
 /// Transient positions (absolute) in a track's clips within `r`.
 pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Samples> {
     let r = if r.is_empty() { Range::new(0, s.content_end()) } else { r };
@@ -463,6 +495,21 @@ mod save_tests {
         let mut r = Engine::default();
         open_session(&mut r, &p).unwrap();
         assert_eq!(r.session().track_by_name("Kick").unwrap().mixer.volume_db, -7.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod stem_tests {
+    #[test]
+    fn stems_one_file_per_track() {
+        let mut e = crate::demo::demo_engine();
+        let dir = std::env::temp_dir().join(format!("soundcraft-stems-{}", std::process::id()));
+        let r = e
+            .execute("file.bounce_stems", &serde_json::json!({"dir": dir.to_string_lossy(), "start": {"seconds": 10.0}, "end": {"seconds": 11.0}}))
+            .unwrap();
+        let n = r["files"].as_array().map_or(0, Vec::len);
+        assert_eq!(n, 7, "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

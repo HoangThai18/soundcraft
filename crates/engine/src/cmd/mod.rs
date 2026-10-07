@@ -7,6 +7,7 @@ use soundcraft_time::{Range, Samples};
 use std::sync::OnceLock;
 
 mod audiosuite;
+mod clap;
 mod clip;
 mod clip_more;
 mod edit;
@@ -108,6 +109,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(clip_more::specs());
         v.extend(event_more::specs());
         v.extend(setup_more::specs());
+        v.extend(clap::specs());
         v
     })
 }

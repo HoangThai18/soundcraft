@@ -248,7 +248,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
         else {
             continue;
         };
-        let Some(info) = soundcraft_dsp::plugin_info(&ins.plugin) else { continue };
+        let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };
         let mut open = true;
         egui::Window::new(format!("{tname} · {} · {}", (b'a' + slot as u8) as char, info.name))
             .id(egui::Id::new(("plugin", tid.0, slot)))

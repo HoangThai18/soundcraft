@@ -624,6 +624,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3383,6 +3389,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-clap-host"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "libloading",
+ "log",
+ "serde",
+ "soundcraft-dsp",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-cli"
 version = "0.1.0"
 dependencies = [
@@ -3413,6 +3431,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soundcraft-audio-io",
+ "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",
  "soundcraft-mix",
@@ -3438,6 +3457,7 @@ dependencies = [
  "log",
  "rayon",
  "soundcraft-audio-io",
+ "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",
  "soundcraft-model",
@@ -3490,6 +3510,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soundcraft-audio-io",
+ "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-engine",
  "soundcraft-midi",

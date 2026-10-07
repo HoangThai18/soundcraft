@@ -209,7 +209,7 @@ impl MixEngine {
             for (slot, ins) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()) {
                 match ins {
                     Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin) => {
-                        *slot = soundcraft_dsp::create(&i.plugin).map(|mut p| {
+                        *slot = create_plugin(&i.plugin).map(|mut p| {
                             p.prepare(sr, mb, ch);
                             PluginSlot { id: i.plugin.clone(), plugin: p, applied: Vec::new() }
                         });
@@ -221,7 +221,7 @@ impl MixEngine {
             let want = t.instrument.as_ref().map(|i| i.plugin.as_str());
             if strip.instrument.as_ref().map(|p| p.id.as_str()) != want {
                 strip.instrument = want.and_then(|id| {
-                    soundcraft_dsp::create(id).map(|mut p| {
+                    create_plugin(id).map(|mut p| {
                         p.prepare(sr, mb, ch.max(2));
                         PluginSlot { id: id.to_string(), plugin: p, applied: Vec::new() }
                     })
@@ -287,11 +287,8 @@ impl MixEngine {
         // for the slowest aux return (aux latencies are from the previous block; they are stable).
         let pdc = s.edit.delay_compensation;
         let lmax_t = if pdc { work.iter().map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
-        let lmax_a = if pdc {
-            self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0)
-        } else {
-            0
-        };
+        let lmax_a =
+            if pdc { self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         self.latency = lmax_t + lmax_a;
         for (t, st) in work.iter_mut() {
             let ch = st.buf.len();
@@ -1105,6 +1102,11 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
         out = vec![l.iter().map(|x| x * g).collect()];
     }
     out
+}
+
+/// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
+fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
+    soundcraft_dsp::create(id).or_else(|| soundcraft_clap_host::create(id))
 }
 
 #[cfg(test)]

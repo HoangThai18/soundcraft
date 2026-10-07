@@ -63,6 +63,23 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"tracks": tracks}))
         }),
         cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true}", always, bounce),
+        cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?}", has_tracks, |e, p| {
+            let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
+            let r = range_param(e, "file.bounce_stems", p)?;
+            let r = if r.is_empty() { soundcraft_time::Range::new(0, e.session().content_end().max(1)) } else { r };
+            let format = match str_param(p, "format") {
+                Some("aiff") | Some("aif") => soundcraft_audio_io::FileFormat::Aiff,
+                Some("flac") => soundcraft_audio_io::FileFormat::Flac,
+                _ => soundcraft_audio_io::FileFormat::Wav,
+            };
+            let bit_depth = match p.get("bit_depth").map(|b| b.to_string().trim_matches('"').to_string()).as_deref() {
+                Some("16") => soundcraft_audio_io::BitDepth::Int16,
+                Some("32") | Some("32f") => soundcraft_audio_io::BitDepth::Float32,
+                _ => soundcraft_audio_io::BitDepth::Int24,
+            };
+            let files = crate::io::bounce_stems(e, &dir, r, &soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None })?;
+            Ok(json!({"files": files}))
+        }),
         cmd!(noundo "file.export_midi", "MIDI...", ["File", "Export"], None, "{path, tracks?}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.export_midi", "`path` required"))?.to_string();
             let bytes = crate::io::export_midi(e)?;
