@@ -1,5 +1,8 @@
 //! `cargo xtask <ci|layers|assets|parity|wasm>` — repository gates.
 
+mod ico;
+mod version;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -149,6 +152,8 @@ fn main() -> ExitCode {
         Some("assets") => assets(),
         Some("parity") => parity(),
         Some("wasm") => wasm(),
+        Some("version") => version::run(args.get(1..).unwrap_or(&[])),
+        Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
         _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|version>".into()),
     };
     match r {

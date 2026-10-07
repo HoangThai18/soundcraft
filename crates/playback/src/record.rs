@@ -28,8 +28,9 @@ pub struct Recorder {
     pub channels: usize,
 }
 
-/// Cap: one hour of 8-channel 192 kHz audio.
-const MAX_SAMPLES: usize = 3600 * 192_000 * 8;
+/// Cap: one hour of 8-channel 192 kHz audio; 64 Mi samples (256 MB of f32) on 32-bit targets
+/// (wasm32, i686), where the 64-bit product doesn't fit in `usize`.
+const MAX_SAMPLES: usize = if usize::BITS >= 64 { (3600u64 * 192_000 * 8) as usize } else { 64 << 20 };
 
 impl Recorder {
     /// Open the default input device. Errors when there is none (the caller shows a message).
