@@ -1059,19 +1059,19 @@ impl Instance {
         self.active
     }
 
-    fn bus_count(&self, media: u32, dir: u32) -> i32 {
+    fn bus_count(&self, media: sv::MediaTypes, dir: sv::BusDirections) -> i32 {
         // SAFETY: valid component.
         unsafe { self.component.getBusCount(media as sv::MediaType, dir as sv::BusDirection) }.clamp(0, MAX_BUSES)
     }
 
-    fn arrangement(&self, dir: u32, index: i32) -> Option<sv::SpeakerArrangement> {
+    fn arrangement(&self, dir: sv::BusDirections, index: i32) -> Option<sv::SpeakerArrangement> {
         let p = self.processor()?;
         let mut arr: sv::SpeakerArrangement = 0;
         // SAFETY: valid processor; `arr` is writable.
         ok(unsafe { p.getBusArrangement(dir as sv::BusDirection, index, &mut arr) }).then_some(arr)
     }
 
-    fn bus_channels(&self, dir: u32, index: i32) -> u32 {
+    fn bus_channels(&self, dir: sv::BusDirections, index: i32) -> u32 {
         if let Some(arr) = self.arrangement(dir, index) {
             return arr.count_ones().min(MAX_BUS_CHANNELS);
         }
@@ -1095,7 +1095,7 @@ impl Instance {
         let (din, dout) = (sv::BusDirections_::kInput, sv::BusDirections_::kOutput);
         let nin = self.bus_count(audio, din);
         let nout = self.bus_count(audio, dout);
-        let current = |s: &Self, dir: u32, n: i32| -> Vec<sv::SpeakerArrangement> {
+        let current = |s: &Self, dir: sv::BusDirections, n: i32| -> Vec<sv::SpeakerArrangement> {
             (0..n).map(|i| s.arrangement(dir, i).unwrap_or(sv::SpeakerArr::kStereo)).collect()
         };
         let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
@@ -1166,7 +1166,10 @@ impl Instance {
         self.context.tempo = 120.0;
         self.context.timeSigNumerator = 4;
         self.context.timeSigDenominator = 4;
-        self.context.state = sv::ProcessContext_::StatesAndFlags_::kTempoValid | sv::ProcessContext_::StatesAndFlags_::kTimeSigValid;
+        // The flag constants are the C default enum type: i32 on Windows, u32 elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        let flags = (sv::ProcessContext_::StatesAndFlags_::kTempoValid | sv::ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
+        self.context.state = flags;
         self.host.latency_changed.store(false, Ordering::Relaxed);
         Ok(layout)
     }
